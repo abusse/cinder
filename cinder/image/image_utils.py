@@ -61,11 +61,16 @@ def qemu_img_info(path):
     return imageutils.QemuImgInfo(out)
 
 
-def convert_image(source, dest, out_format, bps_limit=None):
+def convert_image(source, dest, out_format, bps_limit=None, sparse=0):
     """Convert image to other format."""
+    cmd = ['qemu-img', 'convert', '-O', out_format]
 
-    cmd = ('qemu-img', 'convert',
-           '-O', out_format, source, dest)
+    if sparse:
+        # Sparse wil skip writing zeroes, so one should only use it
+        # on backing devices that are already zeroed.
+        cmd += ['-S', str(sparse)]
+
+    cmd += [source, dest]
 
     # Check whether O_DIRECT is supported and set '-t none' if it is
     # This is needed to ensure that all data hit the device before
@@ -80,9 +85,16 @@ def convert_image(source, dest, out_format, bps_limit=None):
             volume_utils.check_for_odirect_support(source,
                                                    dest,
                                                    'oflag=direct')):
-        cmd = ('qemu-img', 'convert',
+        cmd = ['qemu-img', 'convert',
                '-t', 'none',
-               '-O', out_format, source, dest)
+               '-O', out_format]
+
+        if sparse:
+            # Sparse wil skip writing zeroes, so one should only use it
+            # on backing devices that are already zeroed.
+            cmd += ['-S', str(sparse)]
+
+        cmd += [source, dest]
 
     start_time = timeutils.utcnow()
     cgcmd = volume_utils.setup_blkio_cgroup(source, dest, bps_limit)
