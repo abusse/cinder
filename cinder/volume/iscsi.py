@@ -284,3 +284,15 @@ class ISERTgtAdm(_ExportMixin, iscsi.ISERTgtAdm):
 
     def _get_target_for_ensure_export(self, context, volume_id):
         return 1
+
+class CtlAdm(_ExportMixin, iscsi.CtlAdm):
+    def _get_target_and_lun(self, context, volume, max_targets):
+        lun = 1  # For tgtadm the controller is lun 0, dev starts at lun 1
+        iscsi_target = 0  # NOTE(jdg): Not used by tgtadm
+        return iscsi_target, lun
+
+    def _get_iscsi_target(self, context, vol_id):
+        return 0
+
+    def _get_target_for_ensure_export(self, context, volume_id):
+        return 1

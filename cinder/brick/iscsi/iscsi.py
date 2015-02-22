@@ -621,3 +621,88 @@ class ISERTgtAdm(TgtAdm):
                  execute=putils.execute):
         super(ISERTgtAdm, self).__init__(root_helper, volumes_dir,
                                          target_prefix, execute)
+
+
+class CtlAdm(TargetAdmin):
+    """iSCSI target administration using ctladm."""
+
+    def __init__(self, root_helper, ctl_conf='/etc/ctl.conf',
+                 iscsi_iotype='block', execute=putils.execute):
+        super(CtlAdm, self).__init__('/etc/rc.d/ctld', root_helper, execute)
+        self.ctl_conf = ctl_conf
+        self.iscsi_iotype = iscsi_iotype
+
+    def _is_file(self, path):
+        mode = os.stat(path).st_mode
+        return stat.S_ISREG(mode)
+
+    def _iotype(self, path):
+        if self.iscsi_iotype == 'auto':
+            return 'file' if self._is_file(path) else 'block'
+        else:
+            return self.iscsi_iotype
+
+    def create_iscsi_target(self, name, tid, lun, path,
+                            chap_auth=None, **kwargs):
+
+        # NOTE (jdg): Address bug: 1175207
+        kwargs.pop('old_name', None)
+
+        conf_file = self.ctl_conf
+
+        if os.path.exists(conf_file):
+            try:
+                volume_conf = """
+target %s {
+    auth-group no-authentication
+    portal-group pg0
+    lun 0 {
+        backend %s
+        path %s
+    }
+}
+                """ % (name, self._iotype(path), path)
+
+                with utils.temporary_chown(conf_file):
+                    f = open(conf_file, 'a+')
+                    f.write(volume_conf)
+                    f.close()
+            except putils.ProcessExecutionError as e:
+                vol_id = name.split(':')[1]
+                LOG.error(_("Failed to create iscsi target for volume "
+                            "id:%(vol_id)s: %(e)s")
+                          % {'vol_id': vol_id, 'e': e})
+                raise exception.ISCSITargetCreateFailed(volume_id=vol_id)
+
+            self._run('onerestart')
+
+        return tid
+
+    def remove_iscsi_target(self, tid, lun, vol_id, vol_name, **kwargs):
+        LOG.info(_('Removing iscsi_target for volume: %s') % vol_id)
+        vol_uuid_file = vol_name
+        conf_file = self.ctl_conf
+        if os.path.exists(conf_file):
+            with utils.temporary_chown(conf_file):
+                try:
+                    ctl_conf_text = open(conf_file, 'r+')
+                    full_txt = ctl_conf_text.readlines()
+                    new_ctl_conf_txt = []
+                    count = 0
+                    for line in full_txt:
+                        if count > 0:
+                            count -= 1
+                            continue
+                        elif re.search(vol_uuid_file, line):
+                            count = 7
+                            continue
+                        else:
+                            new_ctl_conf_txt.append(line)
+
+                    ctl_conf_text.seek(0)
+                    ctl_conf_text.truncate(0)
+                    ctl_conf_text.writelines(new_ctl_conf_txt)
+                finally:
+                    ctl_conf_text.close()
+
+            self._run('onerestart')

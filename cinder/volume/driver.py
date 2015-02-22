@@ -1085,7 +1085,10 @@ class ISCSIDriver(VolumeDriver):
             return iscsi.LioAdm(root_helper,
                                 CONF.lio_initiator_iqns,
                                 CONF.iscsi_target_prefix, db=db)
-        else:
+        elif CONF.iscsi_helper == 'ctl':
+            return iscsi.CtlAdm(root_helper, '/etc/ctl.conf', CONF.iscsi_iotype,
+                                db=db)
+	    else:
             return iscsi.IetAdm(root_helper, CONF.iet_conf, CONF.iscsi_iotype,
                                 db=db)
 
