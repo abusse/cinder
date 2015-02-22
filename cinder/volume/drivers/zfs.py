@@ -267,7 +267,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
                     self.create_volume(img_cache_volume)
 
                     image_utils.convert_image(
-                        tmp, self.local_path(img_cache_volume), 'raw',
+                        tmp, self.local_path(img_cache_volume), 'raw', None,
                         sparse=64 * 1024)
 
                 self.create_snapshot(img_cache_snapshot)
@@ -391,7 +391,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
 
         volume_path = self.local_path(volume)
 
-        data = self.target_helper.create_export(context, volume, volume_path)
+        data = self.target_helper.create_export(context, volume, volume_path, self.configuration)
         return {
             'provider_location': data['location'],
             'provider_auth': data['auth'],
