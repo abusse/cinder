@@ -632,15 +632,34 @@ class CtlAdm(TargetAdmin):
         self.ctl_conf = ctl_conf
         self.iscsi_iotype = iscsi_iotype
 
-    def _is_file(self, path):
+    def _is_block(self, path):
         mode = os.stat(path).st_mode
-        return stat.S_ISREG(mode)
+        return stat.S_ISBLK(mode)
 
     def _iotype(self, path):
-        if self.iscsi_iotype == 'auto':
-            return 'file' if self._is_file(path) else 'block'
-        else:
-            return self.iscsi_iotype
+         return 'block'
+
+    def show_target(self, tid, iqn=None, **kwargs):
+
+        conf_file = self.ctl_conf
+
+        if iqn is None:
+            raise exception.InvalidParameterValue(
+                err=_('valid iqn needed for show_target'))
+
+        if os.path.exists(conf_file):
+            with utils.temporary_chown(conf_file):
+                try:
+                    ctl_conf_text = open(conf_file, 'r+')
+                    full_txt = ctl_conf_text.readlines()
+                    for line in full_txt:
+                        if re.search(iqn, line):
+                            ctl_conf_text.close()
+                            return
+                finally:
+                    ctl_conf_text.close()
+
+        raise exception.NotFound()
 
     def create_iscsi_target(self, name, tid, lun, path,
                             chap_auth=None, **kwargs):
@@ -651,6 +670,19 @@ class CtlAdm(TargetAdmin):
         conf_file = self.ctl_conf
 
         if os.path.exists(conf_file):
+            with utils.temporary_chown(conf_file):
+                try:
+                    ctl_conf_text = open(conf_file, 'r+')
+                    full_txt = ctl_conf_text.readlines()
+                    for line in full_txt:
+                        if re.search(name, line):
+                            LOG.warn('%s already in config. Will not add again' % name)
+                            ctl_conf_text.close()
+                            return tid
+                finally:
+                    ctl_conf_text.close()
+
+
             try:
                 volume_conf = """
 target %s {
@@ -661,7 +693,7 @@ target %s {
         path %s
     }
 }
-                """ % (name, self._iotype(path), path)
+""" % (name, self._iotype(path), path)
 
                 with utils.temporary_chown(conf_file):
                     f = open(conf_file, 'a+')
