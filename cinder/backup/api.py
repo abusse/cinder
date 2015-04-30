@@ -1,4 +1,6 @@
 # Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (c) 2014 TrilioData, Inc
+# Copyright (c) 2015 EMC Corporation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,15 +21,15 @@ Handles all requests relating to the volume backups service.
 
 
 from eventlet import greenthread
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
 
 from cinder.backup import rpcapi as backup_rpcapi
 from cinder import context
 from cinder.db import base
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import excutils
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI, _LW
 import cinder.policy
 from cinder import quota
 from cinder import utils
@@ -67,6 +69,13 @@ class API(base.Base):
         backup = self.get(context, backup_id)
         if backup['status'] not in ['available', 'error']:
             msg = _('Backup status must be available or error')
+            raise exception.InvalidBackup(reason=msg)
+
+        # Don't allow backup to be deleted if there are incremental
+        # backups dependent on it.
+        deltas = self.get_all(context, {'parent_id': backup['id']})
+        if deltas and len(deltas):
+            msg = _('Incremental backups exist for this backup.')
             raise exception.InvalidBackup(reason=msg)
 
         self.db.backup_update(context, backup_id, {'status': 'deleting'})
@@ -112,13 +121,15 @@ class API(base.Base):
         return [srv['host'] for srv in services if not srv['disabled']]
 
     def create(self, context, name, description, volume_id,
-               container, availability_zone=None):
+               container, incremental=False, availability_zone=None):
         """Make the RPC call to create a volume backup."""
         check_policy(context, 'create')
         volume = self.volume_api.get(context, volume_id)
+
         if volume['status'] != "available":
             msg = _('Volume to be backed up must be available')
             raise exception.InvalidVolume(reason=msg)
+
         volume_host = volume_utils.extract_host(volume['host'], 'host')
         if not self._is_backup_service_enabled(volume, volume_host):
             raise exception.ServiceNotFound(service_id='cinder-backup')
@@ -139,26 +150,46 @@ class API(base.Base):
 
             for over in overs:
                 if 'gigabytes' in over:
-                    msg = _("Quota exceeded for %(s_pid)s, tried to create "
-                            "%(s_size)sG backup (%(d_consumed)dG of "
-                            "%(d_quota)dG already consumed)")
-                    LOG.warn(msg % {'s_pid': context.project_id,
-                                    's_size': volume['size'],
-                                    'd_consumed': _consumed(over),
-                                    'd_quota': quotas[over]})
+                    msg = _LW("Quota exceeded for %(s_pid)s, tried to create "
+                              "%(s_size)sG backup (%(d_consumed)dG of "
+                              "%(d_quota)dG already consumed)")
+                    LOG.warning(msg, {'s_pid': context.project_id,
+                                      's_size': volume['size'],
+                                      'd_consumed': _consumed(over),
+                                      'd_quota': quotas[over]})
                     raise exception.VolumeBackupSizeExceedsAvailableQuota(
                         requested=volume['size'],
                         consumed=_consumed('backup_gigabytes'),
                         quota=quotas['backup_gigabytes'])
                 elif 'backups' in over:
-                    msg = _("Quota exceeded for %(s_pid)s, tried to create "
-                            "backups (%(d_consumed)d backups "
-                            "already consumed)")
+                    msg = _LW("Quota exceeded for %(s_pid)s, tried to create "
+                              "backups (%(d_consumed)d backups "
+                              "already consumed)")
 
-                    LOG.warn(msg % {'s_pid': context.project_id,
-                                    'd_consumed': _consumed(over)})
+                    LOG.warning(msg, {'s_pid': context.project_id,
+                                      'd_consumed': _consumed(over)})
                     raise exception.BackupLimitExceeded(
                         allowed=quotas[over])
+
+        # Find the latest backup of the volume and use it as the parent
+        # backup to do an incremental backup.
+        latest_backup = None
+        if incremental:
+            backups = self.db.backup_get_all_by_volume(context.elevated(),
+                                                       volume_id)
+            if backups:
+                latest_backup = max(backups, key=lambda x: x['created_at'])
+            else:
+                msg = _('No backups available to do an incremental backup.')
+                raise exception.InvalidBackup(reason=msg)
+
+        parent_id = None
+        if latest_backup:
+            parent_id = latest_backup['id']
+            if latest_backup['status'] != "available":
+                msg = _('The parent backup must be available for '
+                        'incremental backup.')
+                raise exception.InvalidBackup(reason=msg)
 
         self.db.volume_update(context, volume_id, {'status': 'backing-up'})
         options = {'user_id': context.user_id,
@@ -168,6 +199,7 @@ class API(base.Base):
                    'volume_id': volume_id,
                    'status': 'creating',
                    'container': container,
+                   'parent_id': parent_id,
                    'size': volume['size'],
                    'host': volume_host, }
         try:
@@ -180,9 +212,9 @@ class API(base.Base):
                 finally:
                     QUOTAS.rollback(context, reservations)
 
-        #TODO(DuncanT): In future, when we have a generic local attach,
-        #               this can go via the scheduler, which enables
-        #               better load balancing and isolation of services
+        # TODO(DuncanT): In future, when we have a generic local attach,
+        #                this can go via the scheduler, which enables
+        #                better load balancing and isolation of services
         self.backup_rpcapi.create_backup(context,
                                          backup['host'],
                                          backup['id'],
@@ -209,8 +241,8 @@ class API(base.Base):
             name = 'restore_backup_%s' % backup_id
             description = 'auto-created_from_restore_from_backup'
 
-            LOG.info(_("Creating volume of %(size)s GB for restore of "
-                       "backup %(backup_id)s"),
+            LOG.info(_LI("Creating volume of %(size)s GB for restore of "
+                         "backup %(backup_id)s"),
                      {'size': size, 'backup_id': backup_id},
                      context=context)
             volume = self.volume_api.create(context, size, name, description)
@@ -228,16 +260,16 @@ class API(base.Base):
             msg = _('Volume to be restored to must be available')
             raise exception.InvalidVolume(reason=msg)
 
-        LOG.debug('Checking backup size %s against volume size %s',
-                  size, volume['size'])
+        LOG.debug('Checking backup size %(bs)s against volume size %(vs)s',
+                  {'bs': size, 'vs': volume['size']})
         if size > volume['size']:
             msg = (_('volume size %(volume_size)d is too small to restore '
                      'backup of size %(size)d.') %
                    {'volume_size': volume['size'], 'size': size})
             raise exception.InvalidVolume(reason=msg)
 
-        LOG.info(_("Overwriting volume %(volume_id)s with restore of "
-                   "backup %(backup_id)s"),
+        LOG.info(_LI("Overwriting volume %(volume_id)s with restore of "
+                     "backup %(backup_id)s"),
                  {'volume_id': volume_id, 'backup_id': backup_id},
                  context=context)
 

@@ -24,6 +24,8 @@ import math
 import re
 import time
 
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 import webob.dec
 import webob.exc
 
@@ -31,8 +33,6 @@ from cinder.api.openstack import wsgi
 from cinder.api.views import limits as limits_views
 from cinder.api import xmlutil
 from cinder.i18n import _
-from cinder.openstack.common import importutils
-from cinder.openstack.common import jsonutils
 from cinder import quota
 from cinder import wsgi as base_wsgi
 
@@ -136,9 +136,11 @@ class Limit(object):
         self.water_level = 0
         self.capacity = self.unit
         self.request_value = float(self.capacity) / float(self.value)
-        msg = _("Only %(value)s %(verb)s request(s) can be "
-                "made to %(uri)s every %(unit_string)s.")
-        self.error_message = msg % self.__dict__
+        msg = (_("Only %(value)s %(verb)s request(s) can be "
+               "made to %(uri)s every %(unit_string)s.") %
+               {'value': self.value, 'verb': self.verb,
+                'uri': self.uri, 'unit_string': self.unit_string})
+        self.error_message = msg
 
     def __call__(self, verb, url):
         """Represent a call to this limit from a relevant request.

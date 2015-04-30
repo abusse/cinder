@@ -15,7 +15,7 @@
 
 """The cgsnapshots api."""
 
-
+from oslo_log import log as logging
 import webob
 from webob import exc
 
@@ -26,8 +26,7 @@ from cinder.api.views import cgsnapshots as cgsnapshot_views
 from cinder.api import xmlutil
 from cinder import consistencygroup as consistencygroupAPI
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI
 from cinder import utils
 
 LOG = logging.getLogger(__name__)
@@ -110,7 +109,7 @@ class CgsnapshotsController(wsgi.Controller):
         LOG.debug('delete called for member %s', id)
         context = req.environ['cinder.context']
 
-        LOG.info(_('Delete cgsnapshot with id: %s'), id, context=context)
+        LOG.info(_LI('Delete cgsnapshot with id: %s'), id, context=context)
 
         try:
             cgsnapshot = self.cgsnapshot_api.get_cgsnapshot(
@@ -183,7 +182,7 @@ class CgsnapshotsController(wsgi.Controller):
         name = cgsnapshot.get('name', None)
         description = cgsnapshot.get('description', None)
 
-        LOG.info(_("Creating cgsnapshot %(name)s."),
+        LOG.info(_LI("Creating cgsnapshot %(name)s."),
                  {'name': name},
                  context=context)
 

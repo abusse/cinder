@@ -14,9 +14,9 @@
 #    under the License.
 
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from cinder.openstack.common import log as logging
 from cinder.tests.integrated import integrated_helpers
 
 

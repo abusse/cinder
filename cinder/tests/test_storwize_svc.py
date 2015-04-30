@@ -23,15 +23,15 @@ import re
 import time
 
 import mock
+from oslo_concurrency import processutils
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import units
 
 from cinder import context
 from cinder import exception
 from cinder.i18n import _
-from cinder.openstack.common import excutils
-from cinder.openstack.common import importutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder.openstack.common import units
 from cinder import test
 from cinder.tests import utils as testutils
 from cinder import utils
@@ -45,13 +45,14 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 
-class StorwizeSVCManagementSimulator:
+class StorwizeSVCManagementSimulator(object):
     def __init__(self, pool_name):
         self._flags = {'storwize_svc_volpool_name': pool_name}
         self._volumes_list = {}
         self._hosts_list = {}
         self._mappings_list = {}
         self._fcmappings_list = {}
+        self._fcconsistgrp_list = {}
         self._other_pools = {'openstack2': {}, 'openstack3': {}}
         self._next_cmd_error = {
             'lsportip': '',
@@ -123,27 +124,50 @@ class StorwizeSVCManagementSimulator:
             'CMMVC5709E': ('', 'CMMVC5709E [-%(VALUE)s] is not a supported '
                                'parameter.'),
         }
-        self._transitions = {'begin': {'make': 'idle_or_copied'},
-                             'idle_or_copied': {'prepare': 'preparing',
-                                                'delete': 'end',
-                                                'delete_force': 'end'},
-                             'preparing': {'flush_failed': 'stopped',
-                                           'wait': 'prepared'},
-                             'end': None,
-                             'stopped': {'prepare': 'preparing',
-                                         'delete_force': 'end'},
-                             'prepared': {'stop': 'stopped',
-                                          'start': 'copying'},
-                             'copying': {'wait': 'idle_or_copied',
-                                         'stop': 'stopping'},
-                             # Assume the worst case where stopping->stopped
-                             # rather than stopping idle_or_copied
-                             'stopping': {'wait': 'stopped'},
-                             }
+        self._fc_transitions = {'begin': {'make': 'idle_or_copied'},
+                                'idle_or_copied': {'prepare': 'preparing',
+                                                   'delete': 'end',
+                                                   'delete_force': 'end'},
+                                'preparing': {'flush_failed': 'stopped',
+                                              'wait': 'prepared'},
+                                'end': None,
+                                'stopped': {'prepare': 'preparing',
+                                            'delete_force': 'end'},
+                                'prepared': {'stop': 'stopped',
+                                             'start': 'copying'},
+                                'copying': {'wait': 'idle_or_copied',
+                                            'stop': 'stopping'},
+                                # Assume the worst case where stopping->stopped
+                                # rather than stopping idle_or_copied
+                                'stopping': {'wait': 'stopped'},
+                                }
+
+        self._fc_cg_transitions = {'begin': {'make': 'empty'},
+                                   'empty': {'add': 'idle_or_copied'},
+                                   'idle_or_copied': {'prepare': 'preparing',
+                                                      'delete': 'end',
+                                                      'delete_force': 'end'},
+                                   'preparing': {'flush_failed': 'stopped',
+                                                 'wait': 'prepared'},
+                                   'end': None,
+                                   'stopped': {'prepare': 'preparing',
+                                               'delete_force': 'end'},
+                                   'prepared': {'stop': 'stopped',
+                                                'start': 'copying',
+                                                'delete_force': 'end',
+                                                'delete': 'end'},
+                                   'copying': {'wait': 'idle_or_copied',
+                                               'stop': 'stopping',
+                                               'delete_force': 'end',
+                                               'delete': 'end'},
+                                   # Assume the case where stopping->stopped
+                                   # rather than stopping idle_or_copied
+                                   'stopping': {'wait': 'stopped'},
+                                   }
 
     def _state_transition(self, function, fcmap):
         if (function == 'wait' and
-                'wait' not in self._transitions[fcmap['status']]):
+                'wait' not in self._fc_transitions[fcmap['status']]):
             return ('', '')
 
         if fcmap['status'] == 'copying' and function == 'wait':
@@ -157,10 +181,23 @@ class StorwizeSVCManagementSimulator:
         else:
             try:
                 curr_state = fcmap['status']
-                fcmap['status'] = self._transitions[curr_state][function]
+                fcmap['status'] = self._fc_transitions[curr_state][function]
                 return ('', '')
             except Exception:
                 return self._errors['CMMVC5903E']
+
+    def _fc_cg_state_transition(self, function, fc_consistgrp):
+        if (function == 'wait' and
+                'wait' not in self._fc_transitions[fc_consistgrp['status']]):
+            return ('', '')
+
+        try:
+            curr_state = fc_consistgrp['status']
+            fc_consistgrp['status'] \
+                = self._fc_cg_transitions[curr_state][function]
+            return ('', '')
+        except Exception:
+            return self._errors['CMMVC5903E']
 
     # Find an unused ID
     @staticmethod
@@ -215,7 +252,8 @@ class StorwizeSVCManagementSimulator:
             'vdisk',
             'warning',
             'wwpn',
-            'primary'
+            'primary',
+            'consistgrp'
         ]
         no_or_one_param_args = [
             'autoexpand',
@@ -348,11 +386,15 @@ class StorwizeSVCManagementSimulator:
         if 'obj' not in kwargs:
             return self._print_info_cmd(rows=rows, **kwargs)
         else:
-            if kwargs['obj'] == self._flags['storwize_svc_volpool_name']:
+            pool_name = kwargs['obj'].strip('\'\"')
+            if pool_name == kwargs['obj']:
+                raise exception.InvalidInput(
+                    reason=_('obj missing quotes %s') % kwargs['obj'])
+            elif pool_name == self._flags['storwize_svc_volpool_name']:
                 row = rows[1]
-            elif kwargs['obj'] == 'openstack2':
+            elif pool_name == 'openstack2':
                 row = rows[2]
-            elif kwargs['obj'] == 'openstack3':
+            elif pool_name == 'openstack3':
                 row = rows[3]
             else:
                 return self._errors['CMMVC5754E']
@@ -586,6 +628,11 @@ port_speed!N/A
                   'easy_tier': volume_info['easy_tier'],
                   'compressed_copy': volume_info['compressed_copy']}
         volume_info['copies'] = {'0': vol_cp}
+
+        mdiskgrp = kwargs['mdiskgrp'].strip('\'\"')
+        if mdiskgrp == kwargs['mdiskgrp']:
+            raise exception.InvalidInput(
+                reason=_('mdiskgrp missing quotes %s') % kwargs['mdiskgrp'])
 
         if volume_info['name'] in self._volumes_list:
             return self._errors['CMMVC6035E']
@@ -1057,7 +1104,7 @@ port_speed!N/A
 
         if (self._volumes_list[source]['capacity'] !=
                 self._volumes_list[target]['capacity']):
-            return self._errors['CMMVC5924E']
+            return self._errors['CMMVC5754E']
 
         fcmap_info = {}
         fcmap_info['source'] = source
@@ -1068,6 +1115,35 @@ port_speed!N/A
         fcmap_info['progress'] = '0'
         fcmap_info['autodelete'] = True if 'autodelete' in kwargs else False
         fcmap_info['status'] = 'idle_or_copied'
+
+        # Add fcmap to consistency group
+        if 'consistgrp' in kwargs:
+            consistgrp = kwargs['consistgrp']
+
+            # if is digit, assume is cg id, else is cg name
+            cg_id = 0
+            if not consistgrp.isdigit():
+                for consistgrp_key in self._fcconsistgrp_list.keys():
+                    if (self._fcconsistgrp_list[consistgrp_key]['name']
+                            == consistgrp):
+                        cg_id = consistgrp_key
+                        fcmap_info['consistgrp'] = consistgrp_key
+                        break
+            else:
+                if int(consistgrp) in self._fcconsistgrp_list.keys():
+                    cg_id = int(consistgrp)
+
+            # If can't find exist consistgrp id, return not exist error
+            if not cg_id:
+                return self._errors['CMMVC5754E']
+
+            fcmap_info['consistgrp'] = cg_id
+            # Add fcmap to consistgrp
+            self._fcconsistgrp_list[cg_id]['fcmaps'][fcmap_info['id']] = (
+                fcmap_info['name'])
+            self._fc_cg_state_transition('add',
+                                         self._fcconsistgrp_list[cg_id])
+
         self._fcmappings_list[fcmap_info['id']] = fcmap_info
 
         return('FlashCopy Mapping, id [' + fcmap_info['id'] +
@@ -1206,6 +1282,123 @@ port_speed!N/A
 
         return self._print_info_cmd(rows=rows, **kwargs)
 
+    # Create a FlashCopy mapping
+    def _cmd_mkfcconsistgrp(self, **kwargs):
+        fcconsistgrp_info = {}
+        fcconsistgrp_info['id'] = self._find_unused_id(self._fcconsistgrp_list)
+
+        if 'name' in kwargs:
+            fcconsistgrp_info['name'] = kwargs['name'].strip('\'\"')
+        else:
+            fcconsistgrp_info['name'] = 'fccstgrp' + fcconsistgrp_info['id']
+
+        if 'autodelete' in kwargs:
+            fcconsistgrp_info['autodelete'] = True
+        else:
+            fcconsistgrp_info['autodelete'] = False
+        fcconsistgrp_info['status'] = 'empty'
+        fcconsistgrp_info['start_time'] = None
+        fcconsistgrp_info['fcmaps'] = {}
+
+        self._fcconsistgrp_list[fcconsistgrp_info['id']] = fcconsistgrp_info
+
+        return('FlashCopy Consistency Group, id [' + fcconsistgrp_info['id'] +
+               '], successfully created', '')
+
+    def _cmd_prestartfcconsistgrp(self, **kwargs):
+        if 'obj' not in kwargs:
+            return self._errors['CMMVC5701E']
+        cg_name = kwargs['obj']
+
+        cg_id = 0
+        for cg_id in self._fcconsistgrp_list.keys():
+            if cg_name == self._fcconsistgrp_list[cg_id]['name']:
+                break
+
+        return self._fc_cg_state_transition('prepare',
+                                            self._fcconsistgrp_list[cg_id])
+
+    def _cmd_startfcconsistgrp(self, **kwargs):
+        if 'obj' not in kwargs:
+            return self._errors['CMMVC5701E']
+        cg_name = kwargs['obj']
+
+        cg_id = 0
+        for cg_id in self._fcconsistgrp_list.keys():
+            if cg_name == self._fcconsistgrp_list[cg_id]['name']:
+                break
+
+        return self._fc_cg_state_transition('start',
+                                            self._fcconsistgrp_list[cg_id])
+
+    def _cmd_stopfcconsistgrp(self, **kwargs):
+        if 'obj' not in kwargs:
+            return self._errors['CMMVC5701E']
+        id_num = kwargs['obj']
+
+        try:
+            fcconsistgrps = self._fcconsistgrp_list[id_num]
+        except KeyError:
+            return self._errors['CMMVC5753E']
+
+        return self._fc_cg_state_transition('stop', fcconsistgrps)
+
+    def _cmd_rmfcconsistgrp(self, **kwargs):
+        if 'obj' not in kwargs:
+            return self._errors['CMMVC5701E']
+        cg_name = kwargs['obj']
+        force = True if 'force' in kwargs else False
+
+        cg_id = 0
+        for cg_id in self._fcconsistgrp_list.keys():
+            if cg_name == self._fcconsistgrp_list[cg_id]['name']:
+                break
+        if not cg_id:
+            return self._errors['CMMVC5753E']
+        fcconsistgrps = self._fcconsistgrp_list[cg_id]
+
+        function = 'delete_force' if force else 'delete'
+        ret = self._fc_cg_state_transition(function, fcconsistgrps)
+        if fcconsistgrps['status'] == 'end':
+            del self._fcconsistgrp_list[cg_id]
+        return ret
+
+    def _cmd_lsfcconsistgrp(self, **kwargs):
+        rows = []
+
+        if 'obj' not in kwargs:
+            rows.append(['id', 'name', 'status' 'start_time'])
+
+            for fcconsistgrp in self._fcconsistgrp_list.itervalues():
+                rows.append([fcconsistgrp['id'],
+                             fcconsistgrp['name'],
+                             fcconsistgrp['status'],
+                             fcconsistgrp['start_time']])
+            return self._print_info_cmd(rows=rows, **kwargs)
+        else:
+            fcconsistgrp = None
+            cg_id = 0
+            for cg_id in self._fcconsistgrp_list.keys():
+                if self._fcconsistgrp_list[cg_id]['name'] == kwargs['obj']:
+                    fcconsistgrp = self._fcconsistgrp_list[cg_id]
+            rows = []
+            rows.append(['id', str(cg_id)])
+            rows.append(['name', fcconsistgrp['name']])
+            rows.append(['status', fcconsistgrp['status']])
+            rows.append(['autodelete', str(fcconsistgrp['autodelete'])])
+            rows.append(['start_time', str(fcconsistgrp['start_time'])])
+
+            for fcmap_id in fcconsistgrp['fcmaps'].keys():
+                rows.append(['FC_mapping_id', str(fcmap_id)])
+                rows.append(['FC_mapping_name',
+                             fcconsistgrp['fcmaps'][fcmap_id]])
+
+            if 'delim' in kwargs:
+                for index in range(len(rows)):
+                    rows[index] = kwargs['delim'].join(rows[index])
+            self._fc_cg_state_transition('wait', fcconsistgrp)
+            return ('%s' % '\n'.join(rows), '')
+
     def _cmd_migratevdisk(self, **kwargs):
         if 'mdiskgrp' not in kwargs or 'vdisk' not in kwargs:
             return self._errors['CMMVC5707E']
@@ -1249,6 +1442,9 @@ port_speed!N/A
         if 'mdiskgrp' not in kwargs:
             return self._errors['CMMVC5707E']
         mdiskgrp = kwargs['mdiskgrp'].strip('\'\"')
+        if mdiskgrp == kwargs['mdiskgrp']:
+            raise exception.InvalidInput(
+                reason=_('mdiskgrp missing quotes %s') % kwargs['mdiskgrp'])
 
         copy_info = {}
         copy_info['id'] = self._find_unused_id(vol['copies'])
@@ -1473,6 +1669,15 @@ port_speed!N/A
     def error_injection(self, cmd, error):
         self._next_cmd_error[cmd] = error
 
+    def change_vdiskcopy_attr(self, vol_name, key, value, copy="primary"):
+        if copy == 'primary':
+            self._volumes_list[vol_name]['copies']['0'][key] = value
+        elif copy == 'secondary':
+            self._volumes_list[vol_name]['copies']['1'][key] = value
+        else:
+            msg = _("The copy should be primary or secondary")
+            raise exception.InvalidInput(reason=msg)
+
 
 class StorwizeSVCFakeDriver(storwize_svc.StorwizeSVCDriver):
     def __init__(self, *args, **kwargs):
@@ -1674,6 +1879,33 @@ class StorwizeSVCDriverTestCase(test.TestCase):
     def _delete_volume(self, volume):
         self.driver.delete_volume(volume)
         self.db.volume_destroy(self.ctxt, volume['id'])
+
+    def _create_consistencygroup_in_db(self, **kwargs):
+        cg = testutils.create_consistencygroup(self.ctxt, **kwargs)
+        return cg
+
+    def _create_cgsnapshot_in_db(self, cg_id, **kwargs):
+        cg_snapshot = testutils.create_cgsnapshot(self.ctxt,
+                                                  consistencygroup_id= cg_id,
+                                                  **kwargs)
+
+        cg_id = cg_snapshot['consistencygroup_id']
+        volumes = self.db.volume_get_all_by_group(self.ctxt.elevated(), cg_id)
+
+        if not volumes:
+            msg = _("Consistency group is empty. No cgsnapshot "
+                    "will be created.")
+            raise exception.InvalidConsistencyGroup(reason=msg)
+
+        for volume in volumes:
+            testutils.create_snapshot(self.ctxt,
+                                      volume['id'],
+                                      cg_snapshot['id'],
+                                      cg_snapshot['name'],
+                                      cg_snapshot['id'],
+                                      "creating")
+
+        return cg_snapshot
 
     def _create_test_vol(self, opts):
         ctxt = testutils.get_test_admin_context()
@@ -2042,24 +2274,24 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         self.driver._state['enabled_protocols'] = set(['iSCSI'])
         self.driver.validate_connector(conn_iscsi)
         self.driver.validate_connector(conn_both)
-        self.assertRaises(exception.VolumeDriverException,
+        self.assertRaises(exception.InvalidConnectorException,
                           self.driver.validate_connector, conn_fc)
-        self.assertRaises(exception.VolumeDriverException,
+        self.assertRaises(exception.InvalidConnectorException,
                           self.driver.validate_connector, conn_neither)
 
         self.driver._state['enabled_protocols'] = set(['FC'])
         self.driver.validate_connector(conn_fc)
         self.driver.validate_connector(conn_both)
-        self.assertRaises(exception.VolumeDriverException,
+        self.assertRaises(exception.InvalidConnectorException,
                           self.driver.validate_connector, conn_iscsi)
-        self.assertRaises(exception.VolumeDriverException,
+        self.assertRaises(exception.InvalidConnectorException,
                           self.driver.validate_connector, conn_neither)
 
         self.driver._state['enabled_protocols'] = set(['iSCSI', 'FC'])
         self.driver.validate_connector(conn_iscsi)
         self.driver.validate_connector(conn_fc)
         self.driver.validate_connector(conn_both)
-        self.assertRaises(exception.VolumeDriverException,
+        self.assertRaises(exception.InvalidConnectorException,
                           self.driver.validate_connector, conn_neither)
 
     def test_storwize_svc_host_maps(self):
@@ -2087,7 +2319,8 @@ class StorwizeSVCDriverTestCase(test.TestCase):
                                        'iqn.1982-01.com.ibm:1234.sim.node1',
                                        'target_portal': '1.234.56.78:3260',
                                        'target_lun': 0,
-                                       'auth_method': 'CHAP'}}}
+                                       'auth_method': 'CHAP',
+                                       'discovery_auth_method': 'CHAP'}}}
 
         for protocol in ['FC', 'iSCSI']:
             volume1['volume_type_id'] = types[protocol]['id']
@@ -2382,11 +2615,6 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         self.driver.delete_volume(clone)
         self._assert_vol_exists(clone['name'], False)
 
-    # Note defined in python 2.6, so define here...
-    def assertLessEqual(self, a, b, msg=None):
-        if not a <= b:
-            self.fail('%s not less than or equal to %s' % (repr(a), repr(b)))
-
     def test_storwize_svc_get_volume_stats(self):
         self._set_flag('reserved_percentage', 25)
         stats = self.driver.get_volume_stats()
@@ -2565,8 +2793,8 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         old_type_ref = volume_types.create(ctxt, 'old', key_specs_old)
         new_type_ref = volume_types.create(ctxt, 'new', key_specs_new)
 
-        diff, equal = volume_types.volume_types_diff(ctxt, old_type_ref['id'],
-                                                     new_type_ref['id'])
+        diff, _equal = volume_types.volume_types_diff(ctxt, old_type_ref['id'],
+                                                      new_type_ref['id'])
 
         volume = self._generate_vol_info(None, None)
         old_type = volume_types.get_volume_type(ctxt, old_type_ref['id'])
@@ -2655,8 +2883,8 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         old_type_ref = volume_types.create(ctxt, 'old', key_specs_old)
         new_type_ref = volume_types.create(ctxt, 'new', key_specs_new)
 
-        diff, equal = volume_types.volume_types_diff(ctxt, old_type_ref['id'],
-                                                     new_type_ref['id'])
+        diff, _equal = volume_types.volume_types_diff(ctxt, old_type_ref['id'],
+                                                      new_type_ref['id'])
 
         volume = self._generate_vol_info(None, None)
         old_type = volume_types.get_volume_type(ctxt, old_type_ref['id'])
@@ -2688,8 +2916,8 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         old_type_ref = volume_types.create(ctxt, 'old', key_specs_old)
         new_type_ref = volume_types.create(ctxt, 'new', key_specs_new)
 
-        diff, equal = volume_types.volume_types_diff(ctxt, old_type_ref['id'],
-                                                     new_type_ref['id'])
+        diff, _equal = volume_types.volume_types_diff(ctxt, old_type_ref['id'],
+                                                      new_type_ref['id'])
 
         volume = self._generate_vol_info(None, None)
         old_type = volume_types.get_volume_type(ctxt, old_type_ref['id'])
@@ -2825,7 +3053,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         # Make sure that the volumes have been created
         self._assert_vol_exists(volume['name'], True)
 
-        #Set up one WWPN that won't match and one that will.
+        # Set up one WWPN that won't match and one that will.
         self.driver._state['storage_nodes']['1']['WWPN'] = ['123456789ABCDEF0',
                                                             'AABBCCDDEEFF0010']
 
@@ -2859,7 +3087,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         # Make sure that the volumes have been created
         self._assert_vol_exists(volume['name'], True)
 
-        #Set up WWPNs that will not match what is available.
+        # Set up WWPNs that will not match what is available.
         self.driver._state['storage_nodes']['1']['WWPN'] = ['123456789ABCDEF0',
                                                             '123456789ABCDEF1']
 
@@ -2893,7 +3121,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         # Make sure that the volumes have been created
         self._assert_vol_exists(volume['name'], True)
 
-        #Set up one WWPN.
+        # Set up one WWPN.
         self.driver._state['storage_nodes']['1']['WWPN'] = ['AABBCCDDEEFF0012']
 
         wwpns = ['ff00000000000000', 'ff00000000000001']
@@ -3011,13 +3239,69 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         model_update = self.driver.get_replication_status(self.ctxt, volume)
         self.assertEqual('copying', model_update['replication_status'])
 
+        # Primary copy offline, secondary copy online, data consistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'status', 'offline')
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('active-stop', model_update['replication_status'])
+
+        # Primary copy offline, secondary copy online, data inconsistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'No',
+                                       copy="secondary")
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('error', model_update['replication_status'])
+
+        # Primary copy online, secondary copy offline, data consistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'yes',
+                                       copy="secondary")
+        self.sim.change_vdiskcopy_attr(volume['name'], 'status', 'offline',
+                                       copy="secondary")
+        self.sim.change_vdiskcopy_attr(volume['name'], 'status', 'online')
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('error', model_update['replication_status'])
+
+        # Primary copy online, secondary copy offline, data inconsistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'no',
+                                       copy="secondary")
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('error', model_update['replication_status'])
+
+        # Primary copy offline, secondary copy offline, data consistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'yes',
+                                       copy="secondary")
+        self.sim.change_vdiskcopy_attr(volume['name'], 'status', 'offline',
+                                       copy="primary")
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('error', model_update['replication_status'])
+
+        # Primary copy offline, secondary copy offline, data inconsistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'no',
+                                       copy="secondary")
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('error', model_update['replication_status'])
+
+        # Primary copy online, secondary copy online, data inconsistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'status', 'online',
+                                       copy="secondary")
+        self.sim.change_vdiskcopy_attr(volume['name'], 'status', 'online',
+                                       copy="primary")
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'no',
+                                       copy="secondary")
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('copying', model_update['replication_status'])
+
+        # Primary copy online, secondary copy online, data consistent
+        self.sim.change_vdiskcopy_attr(volume['name'], 'sync', 'yes',
+                                       copy="secondary")
+        model_update = self.driver.get_replication_status(self.ctxt, volume)
+        self.assertEqual('active', model_update['replication_status'])
+
         # Check the volume copy created on pool opentack2.
         attrs = self.driver._helpers.get_vdisk_attributes(volume['name'])
         self.assertIn('openstack2', attrs['mdisk_grp_name'])
 
         primary_status = attrs['primary']
-
         self.driver.promote_replica(self.ctxt, volume)
+
         # After promote_replica, primary copy should be swiched.
         attrs = self.driver._helpers.get_vdisk_attributes(volume['name'])
         self.assertEqual(primary_status[0], attrs['primary'][1])
@@ -3084,9 +3368,9 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         disable_type = self._create_replication_volume_type(False)
         enable_type = self._create_replication_volume_type(True)
 
-        diff, equal = volume_types.volume_types_diff(ctxt,
-                                                     disable_type['id'],
-                                                     enable_type['id'])
+        diff, _equal = volume_types.volume_types_diff(ctxt,
+                                                      disable_type['id'],
+                                                      enable_type['id'])
 
         volume = self._generate_vol_info(None, None)
         volume['host'] = host
@@ -3131,9 +3415,9 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         self.assertIsNone(model_update)
 
         enable_type = self._create_replication_volume_type(True)
-        diff, equal = volume_types.volume_types_diff(ctxt,
-                                                     None,
-                                                     enable_type['id'])
+        diff, _equal = volume_types.volume_types_diff(ctxt,
+                                                      None,
+                                                      enable_type['id'])
 
         # Enable replica
         self.driver.retype(ctxt, volume, enable_type, diff, host)
@@ -3201,6 +3485,39 @@ class StorwizeSVCDriverTestCase(test.TestCase):
 
         self.assertEqual(term_data, term_ret)
 
+    def test_storwize_consistency_group_snapshot(self):
+        cg_type = self._create_consistency_group_volume_type()
+
+        cg = self._create_consistencygroup_in_db(volume_type_id=cg_type['id'])
+
+        model_update = self.driver.create_consistencygroup(self.ctxt, cg)
+
+        self.assertEqual(model_update['status'],
+                         'available',
+                         "CG created failed")
+        # Add volumes to CG
+        self._create_volume(volume_type_id=cg_type['id'],
+                            consistencygroup_id=cg['id'])
+        self._create_volume(volume_type_id=cg_type['id'],
+                            consistencygroup_id=cg['id'])
+        self._create_volume(volume_type_id=cg_type['id'],
+                            consistencygroup_id=cg['id'])
+        cg_snapshot = self._create_cgsnapshot_in_db(cg['id'])
+
+        model_update = self.driver.create_cgsnapshot(self.ctxt, cg_snapshot)
+        self.assertEqual('available',
+                         model_update[0]['status'],
+                         "CGSnapshot created failed")
+
+        for snapshot in model_update[1]:
+            self.assertEqual('available', snapshot['status'])
+
+        model_update = self.driver.delete_consistencygroup(self.ctxt, cg)
+
+        self.assertEqual('deleted', model_update[0]['status'])
+        for volume in model_update[1]:
+            self.assertEqual('deleted', volume['status'])
+
     def _create_volume_type_qos(self, extra_specs, fake_qos):
         # Generate a QoS volume type for volume.
         if extra_specs:
@@ -3238,6 +3555,15 @@ class StorwizeSVCDriverTestCase(test.TestCase):
 
         return replication_type
 
+    def _create_consistency_group_volume_type(self):
+        # Generate a volume type for volume consistencygroup.
+        spec = {'capabilities:consistencygroup_support': '<is> True'}
+        type_ref = volume_types.create(self.ctxt, "cg", spec)
+
+        cg_type = volume_types.get_volume_type(self.ctxt, type_ref['id'])
+
+        return cg_type
+
     def _get_vdisk_uid(self, vdisk_name):
         """Return vdisk_UID for given vdisk.
 
@@ -3245,8 +3571,8 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         the vdisk_UID parameter and returns it.
         Returns None if the specified vdisk does not exist.
         """
-        vdisk_properties, err = self.sim._cmd_lsvdisk(obj=vdisk_name,
-                                                      delim='!')
+        vdisk_properties, _err = self.sim._cmd_lsvdisk(obj=vdisk_name,
+                                                       delim='!')
 
         # Iterate through each row until we find the vdisk_UID entry
         for row in vdisk_properties.split('\n'):
@@ -3299,7 +3625,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
 
         # Create a volume as a way of getting a vdisk created, and find out the
         # UID of that vdisk.
-        volume, uid = self._create_volume_and_return_uid('manage_test')
+        _volume, uid = self._create_volume_and_return_uid('manage_test')
 
         # Descriptor of the Cinder volume that we want to own the vdisk
         # referenced by uid.

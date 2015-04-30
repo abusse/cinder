@@ -18,7 +18,7 @@ import datetime
 
 import glanceclient.exc
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
 
 from cinder import context
 from cinder import exception
@@ -79,7 +79,7 @@ class TestGlanceImageService(test.TestCase):
     At a high level, the translations involved are:
 
         1. Glance -> ImageService - This is needed so we can support
-           multple ImageServices (Glance, Local, etc)
+           multiple ImageServices (Glance, Local, etc)
 
         2. ImageService -> API - This is needed so we can support multple
            APIs (OpenStack, EC2)
@@ -97,7 +97,6 @@ class TestGlanceImageService(test.TestCase):
 
     def setUp(self):
         super(TestGlanceImageService, self).setUp()
-        #fakes.stub_out_compute_api_snapshot(self.stubs)
 
         client = glance_stubs.StubGlanceClient()
         self.service = self._create_image_service(client)
@@ -522,8 +521,8 @@ class TestGlanceImageService(test.TestCase):
     def test_glance_client_image_id(self):
         fixture = self._make_fixture(name='test image')
         image_id = self.service.create(self.context, fixture)['id']
-        (service, same_id) = glance.get_remote_image_service(self.context,
-                                                             image_id)
+        (_service, same_id) = glance.get_remote_image_service(self.context,
+                                                              image_id)
         self.assertEqual(same_id, image_id)
 
     def test_glance_client_image_ref(self):
@@ -585,6 +584,63 @@ class TestGlanceImageService(test.TestCase):
         }
         self.assertEqual(actual, expected)
 
+    @mock.patch('cinder.image.glance.CONF')
+    def test_extracting_v2_boot_properties(self, config):
+
+        config.glance_api_version = 2
+
+        attributes = ['size', 'disk_format', 'owner', 'container_format',
+                      'checksum', 'id', 'name', 'created_at', 'updated_at',
+                      'deleted', 'status', 'min_disk', 'min_ram', 'is_public']
+
+        metadata = {
+            'id': 1,
+            'size': 2,
+            'min_disk': 2,
+            'min_ram': 2,
+            'kernel_id': 'foo',
+            'ramdisk_id': 'bar',
+        }
+
+        class FakeSchema(object):
+
+            def __init__(self, base):
+                self.base = base
+
+            def is_base_property(self, key):
+                if key in self.base:
+                    return True
+                else:
+                    return False
+
+        image = glance_stubs.FakeImage(metadata)
+        client = glance_stubs.StubGlanceClient()
+
+        service = self._create_image_service(client)
+        service._image_schema = FakeSchema(attributes)
+        actual = service._translate_from_glance(image)
+        expected = {
+            'id': 1,
+            'name': None,
+            'is_public': None,
+            'size': 2,
+            'min_disk': 2,
+            'min_ram': 2,
+            'disk_format': None,
+            'container_format': None,
+            'checksum': None,
+            'deleted': None,
+            'deleted_at': None,
+            'status': None,
+            'properties': {'kernel_id': 'foo',
+                           'ramdisk_id': 'bar'},
+            'owner': None,
+            'created_at': None,
+            'updated_at': None
+        }
+
+        self.assertEqual(expected, actual)
+
 
 class TestGlanceClientVersion(test.TestCase):
     """Tests the version of the glance client generated."""
@@ -635,7 +691,7 @@ class TestGlanceImageServiceClient(test.TestCase):
             def __init__(inst, version, *args, **kwargs):
                 self.assertEqual('1', version)
                 self.assertEqual("http://fake_host:9292", args[0])
-                self.assertEqual(True, kwargs['token'])
+                self.assertTrue(kwargs['token'])
                 self.assertEqual(60, kwargs['timeout'])
 
         self.stubs.Set(glance.glanceclient, 'Client', MyGlanceStubClient)
@@ -667,7 +723,7 @@ class TestGlanceImageServiceClient(test.TestCase):
             def __init__(inst, version, *args, **kwargs):
                 self.assertEqual("1", version)
                 self.assertEqual("http://fake_host:9292", args[0])
-                self.assertEqual(True, kwargs['token'])
+                self.assertTrue(kwargs['token'])
                 self.assertNotIn('timeout', kwargs)
 
         self.stubs.Set(glance.glanceclient, 'Client', MyGlanceStubClient)

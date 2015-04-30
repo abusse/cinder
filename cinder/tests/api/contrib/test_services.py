@@ -14,8 +14,9 @@
 #    under the License.
 
 
-from datetime import datetime
+import datetime
 
+from oslo_utils import timeutils
 import webob.exc
 
 from cinder.api.contrib import services
@@ -23,45 +24,67 @@ from cinder.api import extensions
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import timeutils
 from cinder import policy
 from cinder import test
 from cinder.tests.api import fakes
 
 
-fake_services_list = [{'binary': 'cinder-scheduler',
-                       'host': 'host1',
-                       'availability_zone': 'cinder',
-                       'id': 1,
-                       'disabled': True,
-                       'updated_at': datetime(2012, 10, 29, 13, 42, 2),
-                       'created_at': datetime(2012, 9, 18, 2, 46, 27),
-                       'disabled_reason': 'test1'},
-                      {'binary': 'cinder-volume',
-                       'host': 'host1',
-                       'availability_zone': 'cinder',
-                       'id': 2,
-                       'disabled': True,
-                       'updated_at': datetime(2012, 10, 29, 13, 42, 5),
-                       'created_at': datetime(2012, 9, 18, 2, 46, 27),
-                       'disabled_reason': 'test2'},
-                      {'binary': 'cinder-scheduler',
-                       'host': 'host2',
-                       'availability_zone': 'cinder',
-                       'id': 3,
-                       'disabled': False,
-                       'updated_at': datetime(2012, 9, 19, 6, 55, 34),
-                       'created_at': datetime(2012, 9, 18, 2, 46, 28),
-                       'disabled_reason': ''},
-                      {'binary': 'cinder-volume',
-                       'host': 'host2',
-                       'availability_zone': 'cinder',
-                       'id': 4,
-                       'disabled': True,
-                       'updated_at': datetime(2012, 9, 18, 8, 3, 38),
-                       'created_at': datetime(2012, 9, 18, 2, 46, 28),
-                       'disabled_reason': 'test4'},
-                      ]
+fake_services_list = [
+    {'binary': 'cinder-scheduler',
+     'host': 'host1',
+     'availability_zone': 'cinder',
+     'id': 1,
+     'disabled': True,
+     'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
+     'created_at': datetime.datetime(2012, 9, 18, 2, 46, 27),
+     'disabled_reason': 'test1',
+     'modified_at': ''},
+    {'binary': 'cinder-volume',
+     'host': 'host1',
+     'availability_zone': 'cinder',
+     'id': 2,
+     'disabled': True,
+     'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 5),
+     'created_at': datetime.datetime(2012, 9, 18, 2, 46, 27),
+     'disabled_reason': 'test2',
+     'modified_at': ''},
+    {'binary': 'cinder-scheduler',
+     'host': 'host2',
+     'availability_zone': 'cinder',
+     'id': 3,
+     'disabled': False,
+     'updated_at': datetime.datetime(2012, 9, 19, 6, 55, 34),
+     'created_at': datetime.datetime(2012, 9, 18, 2, 46, 28),
+     'disabled_reason': '',
+     'modified_at': ''},
+    {'binary': 'cinder-volume',
+     'host': 'host2',
+     'availability_zone': 'cinder',
+     'id': 4,
+     'disabled': True,
+     'updated_at': datetime.datetime(2012, 9, 18, 8, 3, 38),
+     'created_at': datetime.datetime(2012, 9, 18, 2, 46, 28),
+     'disabled_reason': 'test4',
+     'modified_at': ''},
+    {'binary': 'cinder-volume',
+     'host': 'host2',
+     'availability_zone': 'cinder',
+     'id': 5,
+     'disabled': True,
+     'updated_at': datetime.datetime(2012, 9, 18, 8, 3, 38),
+     'created_at': datetime.datetime(2012, 9, 18, 2, 46, 28),
+     'disabled_reason': 'test5',
+     'modified_at': datetime.datetime(2012, 10, 29, 13, 42, 5)},
+    {'binary': 'cinder-volume',
+     'host': 'host2',
+     'availability_zone': 'cinder',
+     'id': 6,
+     'disabled': False,
+     'updated_at': datetime.datetime(2012, 9, 18, 8, 3, 38),
+     'created_at': datetime.datetime(2012, 9, 18, 2, 46, 28),
+     'disabled_reason': '',
+     'modified_at': datetime.datetime(2012, 9, 18, 8, 1, 38)},
+]
 
 
 class FakeRequest(object):
@@ -130,7 +153,7 @@ def fake_policy_enforce(context, action, target):
 
 
 def fake_utcnow():
-    return datetime(2012, 10, 29, 13, 42, 11)
+    return datetime.datetime(2012, 10, 29, 13, 42, 11)
 
 
 class ServicesTest(test.TestCase):
@@ -157,24 +180,36 @@ class ServicesTest(test.TestCase):
         response = {'services': [{'binary': 'cinder-scheduler',
                                   'host': 'host1', 'zone': 'cinder',
                                   'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 10, 29, 13, 42, 2)},
                                  {'binary': 'cinder-volume',
                                   'host': 'host1', 'zone': 'cinder',
                                   'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 10, 29, 13, 42, 5)},
                                  {'binary': 'cinder-scheduler',
                                   'host': 'host2',
                                   'zone': 'cinder',
                                   'status': 'enabled', 'state': 'down',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 9, 19, 6, 55, 34)},
                                  {'binary': 'cinder-volume',
                                   'host': 'host2',
                                   'zone': 'cinder',
                                   'status': 'disabled', 'state': 'down',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
+                                      2012, 9, 18, 8, 3, 38)},
+                                 {'binary': 'cinder-volume',
+                                  'host': 'host2',
+                                  'zone': 'cinder',
+                                  'status': 'disabled', 'state': 'down',
+                                  'updated_at': datetime.datetime(
+                                      2012, 10, 29, 13, 42, 5)},
+                                 {'binary': 'cinder-volume',
+                                  'host': 'host2',
+                                  'zone': 'cinder',
+                                  'status': 'enabled', 'state': 'down',
+                                  'updated_at': datetime.datetime(
                                       2012, 9, 18, 8, 3, 38)}]}
         self.assertEqual(res_dict, response)
 
@@ -187,47 +222,62 @@ class ServicesTest(test.TestCase):
         response = {'services': [{'binary': 'cinder-scheduler',
                                   'host': 'host1', 'zone': 'cinder',
                                   'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 10, 29, 13, 42, 2),
                                   'disabled_reason': 'test1'},
                                  {'binary': 'cinder-volume',
                                   'host': 'host1', 'zone': 'cinder',
                                   'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 10, 29, 13, 42, 5),
                                   'disabled_reason': 'test2'},
                                  {'binary': 'cinder-scheduler',
                                   'host': 'host2',
                                   'zone': 'cinder',
                                   'status': 'enabled', 'state': 'down',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 9, 19, 6, 55, 34),
                                   'disabled_reason': ''},
                                  {'binary': 'cinder-volume',
                                   'host': 'host2',
                                   'zone': 'cinder',
                                   'status': 'disabled', 'state': 'down',
-                                  'updated_at': datetime(
+                                  'updated_at': datetime.datetime(
                                       2012, 9, 18, 8, 3, 38),
-                                  'disabled_reason': 'test4'}]}
+                                  'disabled_reason': 'test4'},
+                                 {'binary': 'cinder-volume',
+                                  'host': 'host2',
+                                  'zone': 'cinder',
+                                  'status': 'disabled', 'state': 'down',
+                                  'updated_at': datetime.datetime(
+                                      2012, 10, 29, 13, 42, 5),
+                                  'disabled_reason': 'test5'},
+                                 {'binary': 'cinder-volume',
+                                  'host': 'host2',
+                                  'zone': 'cinder',
+                                  'status': 'enabled', 'state': 'down',
+                                  'updated_at': datetime.datetime(
+                                      2012, 9, 18, 8, 3, 38),
+                                  'disabled_reason': ''}]}
         self.assertEqual(res_dict, response)
 
     def test_services_list_with_host(self):
         req = FakeRequestWithHost()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-scheduler',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(2012, 10,
-                                                         29, 13, 42, 2)},
-                                 {'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5)}]}
+        response = {'services': [
+            {'binary': 'cinder-scheduler',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled', 'state': 'up',
+             'updated_at': datetime.datetime(2012, 10,
+                                             29, 13, 42, 2)},
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled', 'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)}]}
         self.assertEqual(res_dict, response)
 
     def test_services_detail_with_host(self):
@@ -236,40 +286,56 @@ class ServicesTest(test.TestCase):
         req = FakeRequestWithHost()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-scheduler',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(2012, 10,
-                                                         29, 13, 42, 2),
-                                  'disabled_reason': 'test1'},
-                                 {'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled', 'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5),
-                                  'disabled_reason': 'test2'}]}
+        response = {'services': [
+            {'binary': 'cinder-scheduler',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled', 'state': 'up',
+             'updated_at': datetime.datetime(2012, 10,
+                                             29, 13, 42, 2),
+             'disabled_reason': 'test1'},
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled', 'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test2'}]}
         self.assertEqual(res_dict, response)
 
     def test_services_list_with_service(self):
         req = FakeRequestWithService()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5)},
-                                 {'binary': 'cinder-volume',
-                                  'host': 'host2',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'down',
-                                  'updated_at': datetime(2012, 9, 18,
-                                                         8, 3, 38)}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38)},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'enabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38)}]}
         self.assertEqual(res_dict, response)
 
     def test_services_detail_with_service(self):
@@ -278,42 +344,74 @@ class ServicesTest(test.TestCase):
         req = FakeRequestWithService()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5),
-                                  'disabled_reason': 'test2'},
-                                 {'binary': 'cinder-volume',
-                                  'host': 'host2',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'down',
-                                  'updated_at': datetime(2012, 9, 18,
-                                                         8, 3, 38),
-                                  'disabled_reason': 'test4'}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test2'},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38),
+             'disabled_reason': 'test4'},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test5'},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'enabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38),
+             'disabled_reason': ''}]}
         self.assertEqual(res_dict, response)
 
     def test_services_list_with_binary(self):
         req = FakeRequestWithBinary()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5)},
-                                 {'binary': 'cinder-volume',
-                                  'host': 'host2',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'down',
-                                  'updated_at': datetime(2012, 9, 18,
-                                                         8, 3, 38)}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38)},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'enabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38)}]}
         self.assertEqual(res_dict, response)
 
     def test_services_detail_with_binary(self):
@@ -322,35 +420,53 @@ class ServicesTest(test.TestCase):
         req = FakeRequestWithBinary()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5),
-                                  'disabled_reason': 'test2'},
-                                 {'binary': 'cinder-volume',
-                                  'host': 'host2',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'down',
-                                  'updated_at': datetime(2012, 9, 18,
-                                                         8, 3, 38),
-                                  'disabled_reason': 'test4'}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test2'},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38),
+             'disabled_reason': 'test4'},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test5'},
+            {'binary': 'cinder-volume',
+             'host': 'host2',
+             'zone': 'cinder',
+             'status': 'enabled',
+             'state': 'down',
+             'updated_at': datetime.datetime(2012, 9, 18,
+                                             8, 3, 38),
+             'disabled_reason': ''}]}
         self.assertEqual(res_dict, response)
 
     def test_services_list_with_host_service(self):
         req = FakeRequestWithHostService()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5)}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)}]}
         self.assertEqual(res_dict, response)
 
     def test_services_detail_with_host_service(self):
@@ -359,27 +475,29 @@ class ServicesTest(test.TestCase):
         req = FakeRequestWithHostService()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5),
-                                  'disabled_reason': 'test2'}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test2'}]}
         self.assertEqual(res_dict, response)
 
     def test_services_list_with_host_binary(self):
         req = FakeRequestWithHostBinary()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5)}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5)}]}
         self.assertEqual(res_dict, response)
 
     def test_services_detail_with_host_binary(self):
@@ -388,14 +506,15 @@ class ServicesTest(test.TestCase):
         req = FakeRequestWithHostBinary()
         res_dict = self.controller.index(req)
 
-        response = {'services': [{'binary': 'cinder-volume',
-                                  'host': 'host1',
-                                  'zone': 'cinder',
-                                  'status': 'disabled',
-                                  'state': 'up',
-                                  'updated_at': datetime(2012, 10, 29,
-                                                         13, 42, 5),
-                                  'disabled_reason': 'test2'}]}
+        response = {'services': [
+            {'binary': 'cinder-volume',
+             'host': 'host1',
+             'zone': 'cinder',
+             'status': 'disabled',
+             'state': 'up',
+             'updated_at': datetime.datetime(2012, 10, 29,
+                                             13, 42, 5),
+             'disabled_reason': 'test2'}]}
         self.assertEqual(res_dict, response)
 
     def test_services_enable_with_service_key(self):

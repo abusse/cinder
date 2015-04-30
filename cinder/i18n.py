@@ -18,7 +18,7 @@ See http://docs.openstack.org/developer/oslo.i18n/usage.html .
 
 """
 
-from oslo import i18n
+import oslo_i18n as i18n
 
 from cinder.openstack.common import gettextutils
 
@@ -40,8 +40,8 @@ _LE = _translators.log_error
 _LC = _translators.log_critical
 
 
-def enable_lazy():
-    return i18n.enable_lazy()
+def enable_lazy(enable=True):
+    return i18n.enable_lazy(enable)
 
 
 def translate(value, user_locale=None):

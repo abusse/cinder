@@ -13,7 +13,10 @@
 #   under the License.
 
 
-from oslo import messaging
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_utils import strutils
+import six
 import webob
 
 from cinder.api import extensions
@@ -21,8 +24,6 @@ from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import exception
 from cinder.i18n import _
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import strutils
 from cinder import utils
 from cinder import volume
 
@@ -127,7 +128,11 @@ class VolumeActionsController(wsgi.Controller):
         except exception.VolumeNotFound as error:
             raise webob.exc.HTTPNotFound(explanation=error.msg)
 
-        self.volume_api.detach(context, volume)
+        attachment_id = None
+        if body['os-detach']:
+            attachment_id = body['os-detach'].get('attachment_id', None)
+
+        self.volume_api.detach(context, volume, attachment_id)
         return webob.Response(status_int=202)
 
     @wsgi.action('os-reserve')
@@ -195,6 +200,9 @@ class VolumeActionsController(wsgi.Controller):
             info = self.volume_api.initialize_connection(context,
                                                          volume,
                                                          connector)
+        except exception.InvalidInput as err:
+            raise webob.exc.HTTPBadRequest(
+                explanation=err)
         except exception.VolumeBackendAPIException as error:
             msg = _("Unable to fetch connection information from backend.")
             raise webob.exc.HTTPInternalServerError(explanation=msg)
@@ -262,13 +270,13 @@ class VolumeActionsController(wsgi.Controller):
         except exception.InvalidVolume as error:
             raise webob.exc.HTTPBadRequest(explanation=error.msg)
         except ValueError as error:
-            raise webob.exc.HTTPBadRequest(explanation=unicode(error))
+            raise webob.exc.HTTPBadRequest(explanation=six.text_type(error))
         except messaging.RemoteError as error:
             msg = "%(err_type)s: %(err_msg)s" % {'err_type': error.exc_type,
                                                  'err_msg': error.value}
             raise webob.exc.HTTPBadRequest(explanation=msg)
         except Exception as error:
-            raise webob.exc.HTTPBadRequest(explanation=unicode(error))
+            raise webob.exc.HTTPBadRequest(explanation=six.text_type(error))
         return {'os-volume_upload_image': response}
 
     @wsgi.action('os-extend')

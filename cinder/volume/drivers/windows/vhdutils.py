@@ -30,15 +30,14 @@ import ctypes
 import os
 
 if os.name == 'nt':
-    from ctypes import windll
     from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    virtdisk = ctypes.windll.virtdisk
 
-    kernel32 = windll.kernel32
-    virtdisk = windll.virtdisk
+from oslo_log import log as logging
 
 from cinder import exception
 from cinder.i18n import _
-from cinder.openstack.common import log as logging
 from cinder.volume.drivers.windows import constants
 
 LOG = logging.getLogger(__name__)
@@ -129,7 +128,7 @@ if os.name == 'nt':
                     ("FragmentationPercentage", wintypes.ULONG)]
 
     class Win32_GET_VIRTUAL_DISK_INFO_PARAMETERS(ctypes.Structure):
-        _fields_ = [("VERSION", ctypes.wintypes.UINT),
+        _fields_ = [("VERSION", wintypes.UINT),
                     ("VhdInfo", Win32_VHD_INFO)]
 
     class Win32_SET_VIRTUAL_DISK_INFO_PARAMETERS(ctypes.Structure):

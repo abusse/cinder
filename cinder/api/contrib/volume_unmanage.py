@@ -12,14 +12,14 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
+from oslo_log import log as logging
 import webob
 from webob import exc
 
 from cinder.api import extensions
 from cinder.api.openstack import wsgi
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI
 from cinder import volume
 
 LOG = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class VolumeUnmanageController(wsgi.Controller):
         context = req.environ['cinder.context']
         authorize(context)
 
-        LOG.info(_("Unmanage volume with id: %s"), id, context=context)
+        LOG.info(_LI("Unmanage volume with id: %s"), id, context=context)
 
         try:
             vol = self.volume_api.get(context, id)

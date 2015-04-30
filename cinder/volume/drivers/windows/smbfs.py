@@ -18,14 +18,14 @@ import os
 import re
 import sys
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import units
 
 from cinder import exception
+from cinder.i18n import _
 from cinder.image import image_utils
 from cinder.openstack.common import fileutils
-from cinder.openstack.common.gettextutils import _
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import units
 from cinder import utils
 from cinder.volume.drivers import smbfs
 from cinder.volume.drivers.windows import remotefs
@@ -164,7 +164,7 @@ class WindowsSmbfsDriver(smbfs.SmbfsDriver):
         self.vhdutils.create_differencing_vhd(new_snap_path,
                                               backing_file_full_path)
 
-    def _do_extend_volume(self, volume_path, size_gb):
+    def _do_extend_volume(self, volume_path, size_gb, volume_name=None):
         self.vhdutils.resize_vhd(volume_path, size_gb * units.Gi)
 
     @utils.synchronized('smbfs', external=False)

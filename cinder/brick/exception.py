@@ -14,8 +14,10 @@
 
 """Exceptions for the Brick library."""
 
+from oslo_log import log as logging
+import six
+
 from cinder.i18n import _
-from cinder.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -64,7 +66,7 @@ class BrickException(Exception):
         super(BrickException, self).__init__(message)
 
     def __unicode__(self):
-        return unicode(self.msg)
+        return six.text_type(self.msg)
 
 
 class NotFound(BrickException):
@@ -94,6 +96,10 @@ class NoFibreChannelVolumeDeviceFound(BrickException):
 
 class VolumeDeviceNotFound(BrickException):
     message = _("Volume device not found at %(device)s.")
+
+
+class VolumePathNotRemoved(BrickException):
+    message = _("Volume path %(volume_path)s was not removed in time.")
 
 
 class VolumeGroupNotFound(BrickException):

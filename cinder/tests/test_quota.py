@@ -19,7 +19,8 @@
 import datetime
 
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import timeutils
 
 from cinder import backup
 from cinder import context
@@ -27,7 +28,6 @@ from cinder import db
 from cinder.db.sqlalchemy import api as sqa_api
 from cinder.db.sqlalchemy import models as sqa_models
 from cinder import exception
-from cinder.openstack.common import timeutils
 from cinder import quota
 from cinder import test
 import cinder.tests.image.fake
@@ -98,7 +98,7 @@ class QuotaIntegrationTestCase(test.TestCase):
 
     def test_too_many_volumes(self):
         volume_ids = []
-        for i in range(CONF.quota_volumes):
+        for _i in range(CONF.quota_volumes):
             vol_ref = self._create_volume()
             volume_ids.append(vol_ref['id'])
         self.assertRaises(exception.VolumeLimitExceeded,
@@ -158,7 +158,9 @@ class QuotaIntegrationTestCase(test.TestCase):
                               'name',
                               'description',
                               vol_ref['id'],
-                              'container')
+                              'container',
+                              False,
+                              None)
             db.backup_destroy(self.context, backup_ref['id'])
             db.volume_destroy(self.context, vol_ref['id'])
 
@@ -198,7 +200,8 @@ class QuotaIntegrationTestCase(test.TestCase):
                 name='name',
                 description='description',
                 volume_id=vol_ref['id'],
-                container='container')
+                container='container',
+                incremental=False)
             db.backup_destroy(self.context, backup_ref['id'])
             db.volume_destroy(self.context, vol_ref['id'])
 
@@ -239,7 +242,9 @@ class QuotaIntegrationTestCase(test.TestCase):
                                               'name',
                                               'description',
                                               vol_ref['id'],
-                                              'container')
+                                              'container',
+                                              False,
+                                              None)
 
             # Make sure the backup volume_size isn't included in usage.
             vol_ref2 = volume.API().create(self.context, 10, '', '')

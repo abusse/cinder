@@ -20,18 +20,17 @@ Tests for Backup code.
 import tempfile
 
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import timeutils
 
 from cinder.backup import manager
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import importutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
 from cinder import test
-from cinder.tests.backup.fake_service_with_verify import\
-    get_backup_driver
+from cinder.tests.backup import fake_service_with_verify as fake_service
 
 
 CONF = cfg.CONF
@@ -81,6 +80,8 @@ class BaseBackupTest(test.TestCase):
         backup['status'] = status
         backup['fail_reason'] = ''
         backup['service'] = CONF.backup_driver
+        backup['snapshot'] = False
+        backup['parent_id'] = None
         backup['size'] = size
         backup['object_count'] = object_count
         return db.backup_create(self.ctxt, backup)['id']
@@ -103,6 +104,13 @@ class BaseBackupTest(test.TestCase):
         vol['display_description'] = display_description
         vol['attach_status'] = 'detached'
         return db.volume_create(self.ctxt, vol)['id']
+
+    def _create_volume_attach(self, volume_id):
+        values = {'volume_id': volume_id,
+                  'attach_status': 'attached', }
+        attachment = db.volume_attach(self.ctxt, values)
+        db.volume_attached(self.ctxt, attachment['id'], None, 'testhost',
+                           '/dev/vd0')
 
     def _create_exported_record_entry(self, vol_size=1):
         """Create backup metadata export entry."""
@@ -137,8 +145,12 @@ class BackupTestCase(BaseBackupTest):
         """Make sure stuck volumes and backups are reset to correct
         states when backup_manager.init_host() is called
         """
-        vol1_id = self._create_volume_db_entry(status='backing-up')
-        vol2_id = self._create_volume_db_entry(status='restoring-backup')
+        vol1_id = self._create_volume_db_entry()
+        self._create_volume_attach(vol1_id)
+        db.volume_update(self.ctxt, vol1_id, {'status': 'backing-up'})
+        vol2_id = self._create_volume_db_entry()
+        self._create_volume_attach(vol2_id)
+        db.volume_update(self.ctxt, vol2_id, {'status': 'restoring-backup'})
         backup1_id = self._create_backup_db_entry(status='creating')
         backup2_id = self._create_backup_db_entry(status='restoring')
         backup3_id = self._create_backup_db_entry(status='deleting')
@@ -212,6 +224,17 @@ class BackupTestCase(BaseBackupTest):
         self.assertEqual(backup['status'], 'available')
         self.assertEqual(backup['size'], vol_size)
         self.assertTrue(_mock_volume_backup.called)
+
+    @mock.patch('cinder.volume.utils.notify_about_backup_usage')
+    @mock.patch('%s.%s' % (CONF.volume_driver, 'backup_volume'))
+    def test_create_backup_with_notify(self, _mock_volume_backup, notify):
+        """Test normal backup creation with notifications."""
+        vol_size = 1
+        vol_id = self._create_volume_db_entry(size=vol_size)
+        backup_id = self._create_backup_db_entry(volume_id=vol_id)
+
+        self.backup_mgr.create_backup(self.ctxt, backup_id)
+        self.assertEqual(2, notify.call_count)
 
     def test_restore_backup_with_bad_volume_status(self):
         """Test error handling when restoring a backup to a volume
@@ -302,6 +325,19 @@ class BackupTestCase(BaseBackupTest):
         self.assertEqual(backup['status'], 'available')
         self.assertTrue(_mock_volume_restore.called)
 
+    @mock.patch('cinder.volume.utils.notify_about_backup_usage')
+    @mock.patch('%s.%s' % (CONF.volume_driver, 'restore_backup'))
+    def test_restore_backup_with_notify(self, _mock_volume_restore, notify):
+        """Test normal backup restoration with notifications."""
+        vol_size = 1
+        vol_id = self._create_volume_db_entry(status='restoring-backup',
+                                              size=vol_size)
+        backup_id = self._create_backup_db_entry(status='restoring',
+                                                 volume_id=vol_id)
+
+        self.backup_mgr.restore_backup(self.ctxt, backup_id, vol_id)
+        self.assertEqual(2, notify.call_count)
+
     def test_delete_backup_with_bad_backup_status(self):
         """Test error handling when deleting a backup with a backup
         with a bad status.
@@ -372,6 +408,15 @@ class BackupTestCase(BaseBackupTest):
         self.assertGreaterEqual(timeutils.utcnow(), backup.deleted_at)
         self.assertEqual(backup.status, 'deleted')
 
+    @mock.patch('cinder.volume.utils.notify_about_backup_usage')
+    def test_delete_backup_with_notify(self, notify):
+        """Test normal backup deletion with notifications."""
+        vol_id = self._create_volume_db_entry(size=1)
+        backup_id = self._create_backup_db_entry(status='deleting',
+                                                 volume_id=vol_id)
+        self.backup_mgr.delete_backup(self.ctxt, backup_id)
+        self.assertEqual(2, notify.call_count)
+
     def test_list_backup(self):
         backups = db.backup_get_all_by_project(self.ctxt, 'project1')
         self.assertEqual(len(backups), 0)
@@ -422,7 +467,7 @@ class BackupTestCase(BaseBackupTest):
 
     def test_backup_manager_driver_name(self):
         """"Test mapping between backup services and backup drivers."""
-        cfg.CONF.set_override('backup_driver', "cinder.backup.services.swift")
+        self.override_config('backup_driver', "cinder.backup.services.swift")
         backup_mgr = \
             importutils.import_object(CONF.backup_manager)
         self.assertEqual('cinder.backup.drivers.swift',
@@ -494,7 +539,7 @@ class BackupTestCase(BaseBackupTest):
         export['backup_service'] = 'cinder.tests.backup.bad_service'
         imported_record = self._create_export_record_db_entry()
 
-        #Test the case where the additional hosts list is empty
+        # Test the case where the additional hosts list is empty
         backup_hosts = []
         self.assertRaises(exception.ServiceNotFound,
                           self.backup_mgr.import_record,
@@ -504,8 +549,8 @@ class BackupTestCase(BaseBackupTest):
                           export['backup_url'],
                           backup_hosts)
 
-        #Test that the import backup keeps calling other hosts to find a
-        #suitable host for the backup service
+        # Test that the import backup keeps calling other hosts to find a
+        # suitable host for the backup service
         backup_hosts = ['fake1', 'fake2']
         BackupAPI_import = 'cinder.backup.rpcapi.BackupAPI.import_record'
         with mock.patch(BackupAPI_import) as _mock_backup_import:
@@ -546,8 +591,8 @@ class BackupTestCaseWithVerify(BaseBackupTest):
     """Test Case for backups."""
 
     def setUp(self):
-        CONF.set_override("backup_driver",
-                          "cinder.tests.backup.fake_service_with_verify")
+        self.override_config("backup_driver",
+                             "cinder.tests.backup.fake_service_with_verify")
         super(BackupTestCaseWithVerify, self).setUp()
 
     def test_import_record_with_verify(self):
@@ -613,7 +658,7 @@ class BackupTestCaseWithVerify(BaseBackupTest):
                                '_map_service_to_driver') as \
                 mock_map_service_to_driver:
             mock_map_service_to_driver.return_value = \
-                get_backup_driver(self.ctxt)
+                fake_service.get_backup_driver(self.ctxt)
             self.backup_mgr.reset_status(self.ctxt,
                                          backup_id,
                                          'available')

@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 import webob
 from webob import exc
 
@@ -22,8 +23,7 @@ from cinder.api.openstack import wsgi
 from cinder.api.views import transfers as transfer_view
 from cinder.api import xmlutil
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI
 from cinder import transfer as transferAPI
 from cinder import utils
 
@@ -131,12 +131,15 @@ class VolumeTransferController(wsgi.Controller):
         filters = req.params.copy()
         LOG.debug('Listing volume transfers')
         transfers = self.transfer_api.get_all(context, filters=filters)
+        transfer_count = len(transfers)
         limited_list = common.limited(transfers, req)
 
         if is_detail:
-            transfers = self._view_builder.detail_list(req, limited_list)
+            transfers = self._view_builder.detail_list(req, limited_list,
+                                                       transfer_count)
         else:
-            transfers = self._view_builder.summary_list(req, limited_list)
+            transfers = self._view_builder.summary_list(req, limited_list,
+                                                        transfer_count)
 
         return transfers
 
@@ -160,7 +163,7 @@ class VolumeTransferController(wsgi.Controller):
 
         name = transfer.get('name', None)
 
-        LOG.info(_("Creating transfer of volume %s"),
+        LOG.info(_LI("Creating transfer of volume %s"),
                  volume_id,
                  context=context)
 
@@ -194,7 +197,7 @@ class VolumeTransferController(wsgi.Controller):
             msg = _("Incorrect request body format")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        LOG.info(_("Accepting transfer %s"), transfer_id,
+        LOG.info(_LI("Accepting transfer %s"), transfer_id,
                  context=context)
 
         try:
@@ -215,7 +218,7 @@ class VolumeTransferController(wsgi.Controller):
         """Delete a transfer."""
         context = req.environ['cinder.context']
 
-        LOG.info(_("Delete transfer with id: %s"), id, context=context)
+        LOG.info(_LI("Delete transfer with id: %s"), id, context=context)
 
         try:
             self.transfer_api.delete(context, transfer_id=id)

@@ -19,11 +19,11 @@ Utility class for Windows Storage Server 2012 volume related operations.
 import ctypes
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI
 from cinder.volume.drivers.windows import constants
 
 # Check needed for unit testing on Unix
@@ -158,6 +158,19 @@ class WindowsUtils(object):
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
 
+    def import_wt_disk(self, vhd_path, vol_name):
+        """Import a vhd/x image to be used by Windows iSCSI targets"""
+        try:
+            self._conn_wmi.WT_Disk.ImportWTDisk(DevicePath=vhd_path,
+                                                Description=vol_name)
+        except wmi.x_wmi as exc:
+            err_msg = (_("Failed to import disk: %(vhd_path)s. "
+                         "WMI exception: %(exc)s") %
+                       {'vhd_path': vhd_path,
+                        'exc': exc})
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
     def change_disk_status(self, vol_name, enabled):
         try:
             cl = self._conn_wmi.WT_Disk(Description=vol_name)[0]
@@ -270,8 +283,8 @@ class WindowsUtils(object):
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
             else:
-                LOG.info(_('Ignored target creation error "%s"'
-                           ' while ensuring export'), exc)
+                LOG.info(_LI('Ignored target creation error "%s"'
+                             ' while ensuring export'), exc)
 
     def remove_iscsi_target(self, target_name):
         """Removes ISCSI target."""
@@ -311,22 +324,44 @@ class WindowsUtils(object):
 
     def copy_vhd_disk(self, source_path, destination_path):
         """Copy the vhd disk from source path to destination path."""
-        try:
-            vhdfiles = self._conn_cimv2.query(
-                "Select * from CIM_DataFile where Name = '" +
-                source_path + "'")
-            if len(vhdfiles) > 0:
-                vhdfiles[0].Copy(destination_path)
-        except wmi.x_wmi as exc:
-            err_msg = (_(
-                'copy_vhd_disk: error when copying disk from source path : '
-                '%(src_path)s to destination path: %(dest_path)s '
-                '. WMI exception: '
-                '%(wmi_exc)s') % {'src_path': source_path,
-                                  'dest_path': destination_path,
-                                  'wmi_exc': exc})
+        # Note: As WQL is a small subset of SQL which does not allow multiple
+        # queries or comments, WQL queries are not exposed to WQL injection.
+        vhdfiles = self._conn_cimv2.query(
+            "Select * from CIM_DataFile where Name = '%s'" % source_path)
+        if len(vhdfiles) > 0:
+            ret_val = vhdfiles[0].Copy(destination_path)[0]
+            if ret_val:
+                err_msg = (
+                    _('Could not copy virtual disk %(src_path)s '
+                      'to %(dest_path)s. Error code: %(error_code)s') %
+                    {'src_path': source_path,
+                     'dest_path': destination_path,
+                     'error_code': ret_val})
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
+        else:
+            err_msg = (
+                _('Could not copy virtual disk %(src_path)s '
+                  'to %(dest_path)s. Could not find source path.') %
+                {'src_path': source_path,
+                 'dest_path': destination_path})
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
+
+    def is_resize_needed(self, vhd_path, new_size, old_size):
+        if new_size > old_size:
+            return True
+        elif old_size > new_size:
+            err_msg = (_("Cannot resize image %(vhd_path)s "
+                         "to a smaller size. "
+                         "Image size: %(old_size)s, "
+                         "Requested size: %(new_size)s") %
+                       {'vhd_path': vhd_path,
+                        'old_size': old_size,
+                        'new_size': new_size})
+            raise exception.VolumeBackendAPIException(data=err_msg)
+        return False
 
     def extend(self, vol_name, additional_size):
         """Extend an existing volume."""

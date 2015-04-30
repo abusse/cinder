@@ -35,17 +35,18 @@ from xml import sax
 from xml.sax import expatreader
 from xml.sax import saxutils
 
-from oslo.config import cfg
+from oslo_concurrency import lockutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import timeutils
+import retrying
 import six
 
 from cinder.brick.initiator import connector
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import importutils
-from cinder.openstack.common import lockutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder.openstack.common import timeutils
+from cinder.i18n import _, _LE
 
 
 CONF = cfg.CONF
@@ -168,7 +169,7 @@ def check_ssh_injection(cmd_list):
         # Second, check whether danger character in command. So the shell
         # special operator must be a single argument.
         for c in ssh_injection_pattern:
-            if arg == c:
+            if c not in arg:
                 continue
 
             result = arg.find(c)
@@ -274,37 +275,6 @@ def last_completed_audit_period(unit=None):
         begin = end - datetime.timedelta(hours=1)
 
     return (begin, end)
-
-
-class LazyPluggable(object):
-    """A pluggable backend loaded lazily based on some value."""
-
-    def __init__(self, pivot, **backends):
-        self.__backends = backends
-        self.__pivot = pivot
-        self.__backend = None
-
-    def __get_backend(self):
-        if not self.__backend:
-            backend_name = CONF[self.__pivot]
-            if backend_name not in self.__backends:
-                raise exception.Error(_('Invalid backend: %s') % backend_name)
-
-            backend = self.__backends[backend_name]
-            if isinstance(backend, tuple):
-                name = backend[0]
-                fromlist = backend[1]
-            else:
-                name = backend
-                fromlist = backend
-
-            self.__backend = __import__(name, None, None, fromlist)
-            LOG.debug('backend %s', self.__backend)
-        return self.__backend
-
-    def __getattr__(self, key):
-        backend = self.__get_backend()
-        return getattr(backend, key)
 
 
 class ProtectedExpatParser(expatreader.ExpatParser):
@@ -414,6 +384,14 @@ def is_valid_boolstr(val):
             val == '1' or val == '0')
 
 
+def is_none_string(val):
+    """Check if a string represents a None value."""
+    if not isinstance(val, six.string_types):
+        return False
+
+    return val.lower() == 'none'
+
+
 def monkey_patch():
     """If the CONF.monkey_patch set as True,
     this function patches a decorator
@@ -479,15 +457,6 @@ def make_dev_path(dev, partition=None, base='/dev'):
     return path
 
 
-def total_seconds(td):
-    """Local total_seconds implementation for compatibility with python 2.6."""
-    if hasattr(td, 'total_seconds'):
-        return td.total_seconds()
-    else:
-        return ((td.days * 86400 + td.seconds) * 10 ** 6 +
-                td.microseconds) / 10.0 ** 6
-
-
 def sanitize_hostname(hostname):
     """Return a hostname which conforms to RFC-952 and RFC-1123 specs."""
     if isinstance(hostname, unicode):
@@ -512,7 +481,7 @@ def service_is_up(service):
     """Check whether a service is up based on last heartbeat."""
     last_heartbeat = service['updated_at'] or service['created_at']
     # Timestamps in DB are UTC.
-    elapsed = total_seconds(timeutils.utcnow() - last_heartbeat)
+    elapsed = (timeutils.utcnow() - last_heartbeat).total_seconds()
     return abs(elapsed) <= CONF.service_down_time
 
 
@@ -554,7 +523,8 @@ def tempdir(**kwargs):
         try:
             shutil.rmtree(tmpdir)
         except OSError as e:
-            LOG.debug('Could not remove tmpdir: %s', e)
+            LOG.debug('Could not remove tmpdir: %s',
+                      six.text_type(e))
 
 
 def walk_class_hierarchy(clazz, encountered=None):
@@ -574,14 +544,23 @@ def get_root_helper():
     return 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
 
 
-def brick_get_connector_properties():
+def brick_get_connector_properties(multipath=False, enforce_multipath=False):
     """wrapper for the brick calls to automatically set
     the root_helper needed for cinder.
+
+    :param multipath:         A boolean indicating whether the connector can
+                              support multipath.
+    :param enforce_multipath: If True, it raises exception when multipath=True
+                              is specified but multipathd is not running.
+                              If False, it falls back to multipath=False
+                              when multipathd is not running.
     """
 
     root_helper = get_root_helper()
     return connector.get_connector_properties(root_helper,
-                                              CONF.my_ip)
+                                              CONF.my_ip,
+                                              multipath,
+                                              enforce_multipath)
 
 
 def brick_get_connector(protocol, driver=None,
@@ -615,7 +594,7 @@ def require_driver_initialized(driver):
     # we can't do anything if the driver didn't init
     if not driver.initialized:
         driver_name = driver.__class__.__name__
-        LOG.error(_("Volume driver %s not initialized") % driver_name)
+        LOG.error(_LE("Volume driver %s not initialized"), driver_name)
         raise exception.DriverNotInitialized()
 
 
@@ -629,6 +608,11 @@ def get_file_gid(path):
     return os.stat(path).st_gid
 
 
+def get_file_size(path):
+    """Returns the file size."""
+    return os.stat(path).st_size
+
+
 def _get_disk_of_partition(devpath, st=None):
     """Returns a disk device path from a partition device path, and stat for
     the device. If devpath is not a partition, devpath is returned as it is.
@@ -636,17 +620,17 @@ def _get_disk_of_partition(devpath, st=None):
     for '/dev/disk1p1' ('p' is prepended to the partition number if the disk
     name ends with numbers).
     """
-    if st is None:
-        st = os.stat(devpath)
     diskpath = re.sub('(?:(?<=\d)p)?\d+$', '', devpath)
     if diskpath != devpath:
         try:
-            st = os.stat(diskpath)
-            if stat.S_ISBLK(st.st_mode):
-                return (diskpath, st)
+            st_disk = os.stat(diskpath)
+            if stat.S_ISBLK(st_disk.st_mode):
+                return (diskpath, st_disk)
         except OSError:
             pass
     # devpath is not a partition
+    if st is None:
+        st = os.stat(devpath)
     return (devpath, st)
 
 
@@ -753,8 +737,7 @@ def remove_invalid_filter_options(context, filters,
     unknown_options = [opt for opt in filters
                        if opt not in allowed_search_options]
     bad_options = ", ".join(unknown_options)
-    log_msg = "Removing options '%s' from query." % bad_options
-    LOG.debug(log_msg)
+    LOG.debug("Removing options '%s' from query.", bad_options)
     for opt in unknown_options:
         del filters[opt]
 
@@ -765,5 +748,67 @@ def is_blk_device(dev):
             return True
         return False
     except Exception:
-        LOG.debug('Path %s not found in is_blk_device check' % dev)
+        LOG.debug('Path %s not found in is_blk_device check', dev)
         return False
+
+
+def retry(exceptions, interval=1, retries=3, backoff_rate=2):
+
+    def _retry_on_exception(e):
+        return isinstance(e, exceptions)
+
+    def _backoff_sleep(previous_attempt_number, delay_since_first_attempt_ms):
+        exp = backoff_rate ** previous_attempt_number
+        wait_for = max(0, interval * exp)
+        LOG.debug("Sleeping for %s seconds", wait_for)
+        return wait_for * 1000.0
+
+    def _print_stop(previous_attempt_number, delay_since_first_attempt_ms):
+        delay_since_first_attempt = delay_since_first_attempt_ms / 1000.0
+        LOG.debug("Failed attempt %s", previous_attempt_number)
+        LOG.debug("Have been at this for %s seconds",
+                  delay_since_first_attempt)
+        return previous_attempt_number == retries
+
+    if retries < 1:
+        raise ValueError('Retries must be greater than or '
+                         'equal to 1 (received: %s). ' % retries)
+
+    def _decorator(f):
+
+        @six.wraps(f)
+        def _wrapper(*args, **kwargs):
+            r = retrying.Retrying(retry_on_exception=_retry_on_exception,
+                                  wait_func=_backoff_sleep,
+                                  stop_func=_print_stop)
+            return r.call(f, *args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def convert_version_to_int(version):
+    try:
+        if isinstance(version, six.string_types):
+            version = convert_version_to_tuple(version)
+        if isinstance(version, tuple):
+            return reduce(lambda x, y: (x * 1000) + y, version)
+    except Exception:
+        msg = _("Version %s is invalid.") % version
+        raise exception.CinderException(msg)
+
+
+def convert_version_to_str(version_int):
+    version_numbers = []
+    factor = 1000
+    while version_int != 0:
+        version_number = version_int - (version_int // factor * factor)
+        version_numbers.insert(0, six.text_type(version_number))
+        version_int = version_int / factor
+
+    return reduce(lambda x, y: "%s.%s" % (x, y), version_numbers)
+
+
+def convert_version_to_tuple(version_str):
+    return tuple(int(part) for part in version_str.split('.'))

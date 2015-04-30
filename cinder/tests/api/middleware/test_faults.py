@@ -16,12 +16,13 @@
 from xml.dom import minidom
 
 import mock
+from oslo_i18n import fixture as i18n_fixture
+from oslo_serialization import jsonutils
 import webob.dec
 
 from cinder.api import common
 from cinder.api.openstack import wsgi
 from cinder.i18n import _
-from cinder.openstack.common import jsonutils
 from cinder import test
 
 
@@ -30,6 +31,7 @@ class TestFaults(test.TestCase):
 
     def setUp(self):
         super(TestFaults, self).setUp()
+        self.useFixture(i18n_fixture.ToggleLazy(True))
 
     def _prepare_xml(self, xml_string):
         """Remove characters from string which hinder XML equality testing."""

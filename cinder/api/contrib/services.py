@@ -14,7 +14,9 @@
 #    under the License.
 
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 import webob.exc
 
 from cinder.api import extensions
@@ -23,8 +25,7 @@ from cinder.api import xmlutil
 from cinder import db
 from cinder import exception
 from cinder.i18n import _
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.openstack.common import versionutils
 from cinder import utils
 
 
@@ -89,8 +90,9 @@ class ServiceController(wsgi.Controller):
         service = ''
         if 'service' in req.GET:
             service = req.GET['service']
-            LOG.deprecated(_("Query by service parameter is deprecated. "
-                             "Please use binary parameter instead."))
+            versionutils.report_deprecated_feature(LOG, _(
+                "Query by service parameter is deprecated. "
+                "Please use binary parameter instead."))
         binary = ''
         if 'binary' in req.GET:
             binary = req.GET['binary']
@@ -104,8 +106,14 @@ class ServiceController(wsgi.Controller):
 
         svcs = []
         for svc in services:
+            updated_at = svc['updated_at']
             delta = now - (svc['updated_at'] or svc['created_at'])
-            alive = abs(utils.total_seconds(delta)) <= CONF.service_down_time
+            delta_sec = delta.total_seconds()
+            if svc['modified_at']:
+                delta_mod = now - svc['modified_at']
+                if abs(delta_sec) >= abs(delta_mod.total_seconds()):
+                    updated_at = svc['modified_at']
+            alive = abs(delta_sec) <= CONF.service_down_time
             art = (alive and "up") or "down"
             active = 'enabled'
             if svc['disabled']:
@@ -113,7 +121,7 @@ class ServiceController(wsgi.Controller):
             ret_fields = {'binary': svc['binary'], 'host': svc['host'],
                           'zone': svc['availability_zone'],
                           'status': active, 'state': art,
-                          'updated_at': svc['updated_at']}
+                          'updated_at': updated_at}
             if detailed:
                 ret_fields['disabled_reason'] = svc['disabled_reason']
             svcs.append(ret_fields)

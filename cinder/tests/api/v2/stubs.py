@@ -30,9 +30,6 @@ def stub_volume(id, **kwargs):
         'host': 'fakehost',
         'size': 1,
         'availability_zone': 'fakeaz',
-        'instance_uuid': 'fakeuuid',
-        'attached_host': None,
-        'mountpoint': '/',
         'status': 'fakestatus',
         'migration_status': None,
         'attach_status': 'attached',
@@ -41,7 +38,7 @@ def stub_volume(id, **kwargs):
         'display_name': 'displayname',
         'display_description': 'displaydesc',
         'updated_at': datetime.datetime(1900, 1, 1, 1, 1, 1),
-        'created_at': datetime.datetime(1, 1, 1, 1, 1, 1),
+        'created_at': datetime.datetime(1900, 1, 1, 1, 1, 1),
         'snapshot_id': None,
         'source_volid': None,
         'volume_type_id': '3e196c20-3c06-11e2-81c1-0800200c9a66',
@@ -49,11 +46,14 @@ def stub_volume(id, **kwargs):
         'volume_admin_metadata': [{'key': 'attached_mode', 'value': 'rw'},
                                   {'key': 'readonly', 'value': 'False'}],
         'bootable': False,
-        'launched_at': datetime.datetime(1, 1, 1, 1, 1, 1),
+        'launched_at': datetime.datetime(1900, 1, 1, 1, 1, 1),
         'volume_type': {'name': 'vol_type_name'},
         'replication_status': 'disabled',
         'replication_extended_status': None,
-        'replication_driver_data': None}
+        'replication_driver_data': None,
+        'volume_attachment': [],
+        'multiattach': False,
+    }
 
     volume.update(kwargs)
     if kwargs.get('volume_glance_metadata', None):
@@ -77,6 +77,16 @@ def stub_volume_create(self, context, size, name, description, snapshot,
         vol['snapshot_id'] = None
     vol['availability_zone'] = param.get('availability_zone', 'fakeaz')
     return vol
+
+
+def stub_image_service_detail(self, context, **kwargs):
+    filters = kwargs.get('filters', {'name': ''})
+    if filters['name'] == "Fedora-x86_64-20-20140618-sda":
+        return [{'id': "c905cedb-7281-47e4-8a62-f26bc5fc4c77"}]
+    elif filters['name'] == "multi":
+        return [{'id': "c905cedb-7281-47e4-8a62-f26bc5fc4c77"},
+                {'id': "c905cedb-abcd-47e4-8a62-f26bc5fc4c77"}]
+    return []
 
 
 def stub_volume_create_from_image(self, context, size, name, description,
@@ -114,15 +124,16 @@ def stub_volume_get_db(context, volume_id):
 
 
 def stub_volume_get_all(context, search_opts=None, marker=None, limit=None,
-                        sort_key='created_at', sort_dir='desc', filters=None,
+                        sort_keys=None, sort_dirs=None, filters=None,
                         viewable_admin_meta=False):
     return [stub_volume(100, project_id='fake'),
             stub_volume(101, project_id='superfake'),
             stub_volume(102, project_id='superduperfake')]
 
 
-def stub_volume_get_all_by_project(self, context, marker, limit, sort_key,
-                                   sort_dir, filters=None,
+def stub_volume_get_all_by_project(self, context, marker, limit,
+                                   sort_keys=None, sort_dirs=None,
+                                   filters=None,
                                    viewable_admin_meta=False):
     filters = filters or {}
     return [stub_volume_get(self, context, '1')]

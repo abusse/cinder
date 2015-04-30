@@ -18,6 +18,8 @@
 from cinder import exception
 from cinder import test
 
+import six
+
 
 class FakeNotifier(object):
     """Acts like the cinder.openstack.common.notifier.api module."""
@@ -54,17 +56,18 @@ class CinderExceptionTestCase(test.TestCase):
             message = "default message"
 
         exc = FakeCinderException()
-        self.assertEqual(unicode(exc), 'default message')
+        self.assertEqual(six.text_type(exc), 'default message')
 
     def test_error_msg(self):
-        self.assertEqual(unicode(exception.CinderException('test')), 'test')
+        self.assertEqual(six.text_type(exception.CinderException('test')),
+                         'test')
 
     def test_default_error_msg_with_kwargs(self):
         class FakeCinderException(exception.CinderException):
             message = "default message: %(code)s"
 
         exc = FakeCinderException(code=500)
-        self.assertEqual(unicode(exc), 'default message: 500')
+        self.assertEqual(six.text_type(exc), 'default message: 500')
 
     def test_error_msg_exception_with_kwargs(self):
         # NOTE(dprince): disable format errors for this test
@@ -74,7 +77,8 @@ class CinderExceptionTestCase(test.TestCase):
             message = "default message: %(misspelled_code)s"
 
         exc = FakeCinderException(code=500)
-        self.assertEqual(unicode(exc), 'default message: %(misspelled_code)s')
+        self.assertEqual(six.text_type(exc),
+                         'default message: %(misspelled_code)s')
 
     def test_default_error_code(self):
         class FakeCinderException(exception.CinderException):
@@ -101,3 +105,26 @@ class CinderExceptionTestCase(test.TestCase):
         exc1 = Exception(msg)
         exc2 = exception.CinderException(kwarg1=exc1)
         self.assertEqual(msg, exc2.kwargs['kwarg1'])
+
+    def test_message_in_format_string(self):
+        class FakeCinderException(exception.CinderException):
+            message = 'FakeCinderException: %(message)s'
+
+        exc = FakeCinderException(message='message')
+        self.assertEqual(six.text_type(exc), 'FakeCinderException: message')
+
+    def test_message_and_kwarg_in_format_string(self):
+        class FakeCinderException(exception.CinderException):
+            message = 'Error %(code)d: %(message)s'
+
+        exc = FakeCinderException(message='message', code=404)
+        self.assertEqual(six.text_type(exc), 'Error 404: message')
+
+    def test_message_is_exception_in_format_string(self):
+        class FakeCinderException(exception.CinderException):
+            message = 'Exception: %(message)s'
+
+        msg = 'test message'
+        exc1 = Exception(msg)
+        exc2 = FakeCinderException(message=exc1)
+        self.assertEqual(six.text_type(exc2), 'Exception: test message')

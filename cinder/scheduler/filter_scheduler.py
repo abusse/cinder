@@ -20,11 +20,11 @@ You can customize this scheduler by specifying your own volume Filters and
 Weighing Functions.
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LW
 from cinder.scheduler import driver
 from cinder.scheduler import scheduler_options
 from cinder.volume import utils
@@ -169,7 +169,7 @@ class FilterScheduler(driver.Scheduler):
         return top_host.obj
 
     def get_pools(self, context, filters):
-        #TODO(zhiteng) Add filters support
+        # TODO(zhiteng) Add filters support
         return self.host_manager.get_pools(context)
 
     def _post_select_populate_filter_properties(self, filter_properties,
@@ -282,6 +282,18 @@ class FilterScheduler(driver.Scheduler):
 
         self.populate_filter_properties(request_spec,
                                         filter_properties)
+
+        # If multiattach is enabled on a volume, we need to add
+        # multiattach to extra specs, so that the capability
+        # filtering is enabled.
+        multiattach = volume_properties.get('multiattach', False)
+        if multiattach and 'multiattach' not in resource_type.get(
+                'extra_specs', {}):
+            if 'extra_specs' not in resource_type:
+                resource_type['extra_specs'] = {}
+
+            resource_type['extra_specs'].update(
+                multiattach='<is> True')
 
         # Find our local list of acceptable hosts by filtering and
         # weighing our options. we virtually consume resources on
@@ -397,8 +409,8 @@ class FilterScheduler(driver.Scheduler):
         weighed_hosts = self._get_weighted_candidates(context, request_spec,
                                                       filter_properties)
         if not weighed_hosts:
-            LOG.warning(_('No weighed hosts found for volume '
-                          'with properties: %s'),
+            LOG.warning(_LW('No weighed hosts found for volume '
+                            'with properties: %s'),
                         filter_properties['request_spec']['volume_type'])
             return None
         return self._choose_top_host(weighed_hosts, request_spec)

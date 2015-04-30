@@ -16,15 +16,15 @@
 import os
 import re
 
-from oslo.config import cfg
+from oslo_concurrency import processutils as putils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import units
 
 from cinder.brick.remotefs import remotefs
 from cinder import exception
+from cinder.i18n import _, _LI, _LW
 from cinder.image import image_utils
-from cinder.openstack.common.gettextutils import _
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils as putils
-from cinder.openstack.common import units
 from cinder import utils
 from cinder.volume.drivers import remotefs as remotefs_drv
 
@@ -39,9 +39,9 @@ volume_opts = [
                help='File with the list of available smbfs shares.'),
     cfg.StrOpt('smbfs_default_volume_format',
                default='qcow2',
+               choices=['raw', 'qcow2', 'vhd', 'vhdx'],
                help=('Default format that will be used when creating volumes '
-                     'if no volume format is specified. Can be set to: '
-                     'raw, qcow2, vhd or vhdx.')),
+                     'if no volume format is specified.')),
     cfg.BoolOpt('smbfs_sparsed_volumes',
                 default=True,
                 help=('Create volumes as sparsed files which take no space '
@@ -166,12 +166,31 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
         """Get volume path (mounted locally fs path) for given volume.
         :param volume: volume reference
         """
+        volume_path_template = self._get_local_volume_path_template(volume)
+        volume_path = self._lookup_local_volume_path(volume_path_template)
+        if volume_path:
+            return volume_path
+
+        # The image does not exist, so retrieve the volume format
+        # in order to build the path.
         fmt = self.get_volume_format(volume)
-        local_dir = self._local_volume_dir(volume)
-        local_path = os.path.join(local_dir, volume['name'])
         if fmt in (self._DISK_FORMAT_VHD, self._DISK_FORMAT_VHDX):
-            local_path += '.' + fmt
-        return local_path
+            volume_path = volume_path_template + '.' + fmt
+        else:
+            volume_path = volume_path_template
+        return volume_path
+
+    def _get_local_volume_path_template(self, volume):
+        local_dir = self._local_volume_dir(volume)
+        local_path_template = os.path.join(local_dir, volume['name'])
+        return local_path_template
+
+    def _lookup_local_volume_path(self, volume_path_template):
+        for ext in ['', self._DISK_FORMAT_VHD, self._DISK_FORMAT_VHDX]:
+            volume_path = (volume_path_template + '.' + ext
+                           if ext else volume_path_template)
+            if os.path.exists(volume_path):
+                return volume_path
 
     def _local_path_volume_info(self, volume):
         return '%s%s' % (self.local_path(volume), '.info')
@@ -183,10 +202,10 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
         return snap_path
 
     def get_volume_format(self, volume, qemu_format=False):
-        volume_dir = self._local_volume_dir(volume)
-        volume_path = os.path.join(volume_dir, volume['name'])
+        volume_path_template = self._get_local_volume_path_template(volume)
+        volume_path = self._lookup_local_volume_path(volume_path_template)
 
-        if os.path.exists(volume_path):
+        if volume_path:
             info = self._qemu_img_info(volume_path, volume['name'])
             volume_format = info.file_format
         else:
@@ -205,8 +224,8 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
     def delete_volume(self, volume):
         """Deletes a logical volume."""
         if not volume['provider_location']:
-            LOG.warn(_('Volume %s does not have provider_location specified, '
-                       'skipping.'), volume['name'])
+            LOG.warn(_LW('Volume %s does not have provider_location '
+                         'specified, skipping.'), volume['name'])
             return
 
         self._ensure_share_mounted(volume['provider_location'])
@@ -227,7 +246,7 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
         pattern = r"qemu-img version ([0-9\.]*)"
         version = re.match(pattern, info)
         if not version:
-            LOG.warn(_("qemu-img is not installed."))
+            LOG.warn(_LW("qemu-img is not installed."))
             return None
         return [int(x) for x in version.groups()[0].split('.')]
 
@@ -404,14 +423,14 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
 
     @utils.synchronized('smbfs', external=False)
     def extend_volume(self, volume, size_gb):
-        LOG.info(_('Extending volume %s.'), volume['id'])
+        LOG.info(_LI('Extending volume %s.'), volume['id'])
         self._extend_volume(volume, size_gb)
 
     def _extend_volume(self, volume, size_gb):
         volume_path = self.local_path(volume)
 
         self._check_extend_volume_support(volume, size_gb)
-        LOG.info(_('Resizing file to %sG...') % size_gb)
+        LOG.info(_LI('Resizing file to %sG...') % size_gb)
 
         self._do_extend_volume(volume_path, size_gb, volume['name'])
 
@@ -460,7 +479,7 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
 
     @utils.synchronized('smbfs', external=False)
     def create_volume_from_snapshot(self, volume, snapshot):
-        self._create_volume_from_snapshot(volume, snapshot)
+        return self._create_volume_from_snapshot(volume, snapshot)
 
     def _copy_volume_from_snapshot(self, snapshot, volume, volume_size):
         """Copy data from snapshot to destination volume.
@@ -532,7 +551,7 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
     @utils.synchronized('smbfs', external=False)
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume."""
-        self._create_cloned_volume(volume, src_vref)
+        return self._create_cloned_volume(volume, src_vref)
 
     def _ensure_share_mounted(self, smbfs_share):
         mnt_flags = []

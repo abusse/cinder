@@ -19,12 +19,12 @@
 Scheduler base class that all Schedulers should inherit from
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import importutils
+from oslo_utils import timeutils
 
 from cinder import db
 from cinder.i18n import _
-from cinder.openstack.common import importutils
-from cinder.openstack.common import timeutils
 from cinder.volume import rpcapi as volume_rpcapi
 
 
@@ -68,6 +68,15 @@ class Scheduler(object):
         self.host_manager = importutils.import_object(
             CONF.scheduler_host_manager)
         self.volume_rpcapi = volume_rpcapi.VolumeAPI()
+
+    def is_ready(self):
+        """Returns True if Scheduler is ready to accept requests.
+
+        This is to handle scheduler service startup when it has no volume hosts
+        stats and will fail all the requests.
+        """
+
+        return self.host_manager.has_all_capabilities()
 
     def update_service_capabilities(self, service_name, host, capabilities):
         """Process a capability update from a service node."""

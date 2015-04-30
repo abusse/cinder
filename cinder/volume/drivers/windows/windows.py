@@ -21,11 +21,11 @@ This driver requires ISCSI target role installed
 
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from cinder.image import image_utils
 from cinder.openstack.common import fileutils
-from cinder.openstack.common import log as logging
 from cinder.volume import driver
 from cinder.volume.drivers.windows import constants
 from cinder.volume.drivers.windows import vhdutils
@@ -167,9 +167,6 @@ class WindowsDriver(driver.ISCSIDriver):
         """Fetch the image from image_service and create a volume using it."""
         # Convert to VHD and file back to VHD
         vhd_type = self.utils.get_supported_vhd_type()
-        if (CONF.image_conversion_dir and not
-                os.path.exists(CONF.image_conversion_dir)):
-            os.makedirs(CONF.image_conversion_dir)
         with image_utils.temporary_file(suffix='.vhd') as tmp:
             volume_path = self.local_path(volume)
             image_utils.fetch_to_vhd(context, image_service, image_id, tmp,
@@ -211,11 +208,20 @@ class WindowsDriver(driver.ISCSIDriver):
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume."""
-        # Create a new volume
-        # Copy VHD file of the volume to clone to the created volume
-        self.create_volume(volume)
-        self.utils.copy_vhd_disk(self.local_path(src_vref),
-                                 self.local_path(volume))
+        vol_name = volume['name']
+        vol_size = volume['size']
+        src_vol_size = src_vref['size']
+
+        new_vhd_path = self.local_path(volume)
+        src_vhd_path = self.local_path(src_vref)
+
+        self.utils.copy_vhd_disk(src_vhd_path,
+                                 new_vhd_path)
+
+        if self.utils.is_resize_needed(new_vhd_path, vol_size, src_vol_size):
+            self.vhdutils.resize_vhd(new_vhd_path, vol_size << 30)
+
+        self.utils.import_wt_disk(new_vhd_path, vol_name)
 
     def get_volume_stats(self, refresh=False):
         """Get volume stats.

@@ -17,13 +17,20 @@
    Note, this is not iSCSI.
 """
 import os
+import re
 
+from oslo_concurrency import processutils as putils
+from oslo_log import log as logging
+
+from cinder.brick import exception
 from cinder.brick import executor
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils as putils
+from cinder.i18n import _, _LW, _LE
+from cinder.openstack.common import loopingcall
 
 LOG = logging.getLogger(__name__)
+
+MULTIPATH_ERROR_REGEX = re.compile("\w{3} \d+ \d\d:\d\d:\d\d \|.*$")
+MULTIPATH_WWID_REGEX = re.compile("\((?P<wwid>.+)\)")
 
 
 class LinuxSCSI(executor.Executor):
@@ -61,9 +68,39 @@ class LinuxSCSI(executor.Executor):
             LOG.debug("Remove SCSI device(%s) with %s" % (device, path))
             self.echo_scsi_command(path, "1")
 
+    def wait_for_volume_removal(self, volume_path):
+        """This is used to ensure that volumes are gone."""
+
+        def _wait_for_volume_removal(volume_path):
+            LOG.debug("Waiting for SCSI mount point %s to be removed.",
+                      volume_path)
+            if os.path.exists(volume_path):
+                if self.tries >= self.scan_attempts:
+                    msg = _LE("Exceeded the number of attempts to detect "
+                              "volume removal.")
+                    LOG.error(msg)
+                    raise exception.VolumePathNotRemoved(
+                        volume_path=volume_path)
+
+                LOG.debug("%(path)s still exists, rescanning. Try number: "
+                          "%(tries)s",
+                          {'path': volume_path, 'tries': self.tries})
+                self.tries = self.tries + 1
+            else:
+                LOG.debug("SCSI mount point %s has been removed.", volume_path)
+                raise loopingcall.LoopingCallDone()
+
+        # Setup a loop here to give the kernel time
+        # to remove the volume from /dev/disk/by-path/
+        self.tries = 0
+        self.scan_attempts = 3
+        timer = loopingcall.FixedIntervalLoopingCall(
+            _wait_for_volume_removal, volume_path)
+        timer.start(interval=2).wait()
+
     def get_device_info(self, device):
-        (out, err) = self._execute('sg_scan', device, run_as_root=True,
-                                   root_helper=self._root_helper)
+        (out, _err) = self._execute('sg_scan', device, run_as_root=True,
+                                    root_helper=self._root_helper)
         dev_info = {'device': device, 'host': None,
                     'channel': None, 'id': None, 'lun': None}
         if out:
@@ -111,7 +148,7 @@ class LinuxSCSI(executor.Executor):
             self._execute('multipath', '-f', device, run_as_root=True,
                           root_helper=self._root_helper)
         except putils.ProcessExecutionError as exc:
-            LOG.warn(_("multipath call failed exit (%(code)s)")
+            LOG.warn(_LW("multipath call failed exit (%(code)s)")
                      % {'code': exc.exit_code})
 
     def flush_multipath_devices(self):
@@ -119,7 +156,7 @@ class LinuxSCSI(executor.Executor):
             self._execute('multipath', '-F', run_as_root=True,
                           root_helper=self._root_helper)
         except putils.ProcessExecutionError as exc:
-            LOG.warn(_("multipath call failed exit (%(code)s)")
+            LOG.warn(_LW("multipath call failed exit (%(code)s)")
                      % {'code': exc.exit_code})
 
     def find_multipath_device(self, device):
@@ -132,33 +169,40 @@ class LinuxSCSI(executor.Executor):
         devices = []
         out = None
         try:
-            (out, err) = self._execute('multipath', '-l', device,
-                                       run_as_root=True,
-                                       root_helper=self._root_helper)
+            (out, _err) = self._execute('multipath', '-l', device,
+                                        run_as_root=True,
+                                        root_helper=self._root_helper)
         except putils.ProcessExecutionError as exc:
-            LOG.warn(_("multipath call failed exit (%(code)s)")
+            LOG.warn(_LW("multipath call failed exit (%(code)s)")
                      % {'code': exc.exit_code})
             return None
 
         if out:
             lines = out.strip()
             lines = lines.split("\n")
+            lines = [line for line in lines
+                     if not re.match(MULTIPATH_ERROR_REGEX, line)]
             if lines:
-                line = lines[0]
-                info = line.split(" ")
-                # device line output is different depending
-                # on /etc/multipath.conf settings.
-                if info[1][:2] == "dm":
-                    mdev = "/dev/%s" % info[1]
-                    mdev_id = info[0]
-                elif info[2][:2] == "dm":
-                    mdev = "/dev/%s" % info[2]
-                    mdev_id = info[1].replace('(', '')
-                    mdev_id = mdev_id.replace(')', '')
 
-                if mdev is None:
-                    LOG.warn(_("Couldn't find multipath device %(line)s")
-                             % {'line': line})
+                # Use the device name, be it the WWID, mpathN or custom alias
+                # of a device to build the device path. This should be the
+                # first item on the first line of output from `multipath -l
+                # ${path}` or `multipath -l ${wwid}`..
+                mdev_name = lines[0].split(" ")[0]
+                mdev = '/dev/mapper/%s' % mdev_name
+
+                # Find the WWID for the LUN if we are using mpathN or aliases.
+                wwid_search = MULTIPATH_WWID_REGEX.search(lines[0])
+                if wwid_search is not None:
+                    mdev_id = wwid_search.group('wwid')
+                else:
+                    mdev_id = mdev_name
+
+                # Confirm that the device is present.
+                try:
+                    os.stat(mdev)
+                except OSError:
+                    LOG.warn(_LW("Couldn't find multipath device %s"), mdev)
                     return None
 
                 LOG.debug("Found multipath device = %(mdev)s"
@@ -182,6 +226,7 @@ class LinuxSCSI(executor.Executor):
         if mdev is not None:
             info = {"device": mdev,
                     "id": mdev_id,
+                    "name": mdev_name,
                     "devices": devices}
             return info
         return None

@@ -16,8 +16,9 @@
 
 from xml.etree import ElementTree as ET
 
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
+from oslo_log import log as logging
+
+from cinder.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def parse_xml_file(filepath):
         root = tree.getroot()
         return root
     except IOError as err:
-        LOG.error(_('parse_xml_file: %s') % err)
+        LOG.error(_LE('parse_xml_file: %s') % err)
         raise err
 
 

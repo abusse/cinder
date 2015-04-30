@@ -15,20 +15,20 @@
 Unit tests for Oracle's ZFSSA Cinder volume driver
 """
 
+import json
+
 import mock
+from oslo_log import log as logging
+from oslo_utils import units
 
-from json import JSONEncoder
-
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import units
-from cinder import test
-from cinder.volume import configuration as conf
 from cinder.volume.drivers.zfssa import restclient as client
-from cinder.volume.drivers.zfssa import zfssaiscsi as iscsi
 from cinder.volume.drivers.zfssa import zfssarest as rest
 
 
 LOG = logging.getLogger(__name__)
+
+nfs_logbias = 'latency'
+nfs_compression = 'off'
 
 
 class FakeZFSSA(object):
@@ -114,24 +114,21 @@ class FakeZFSSA(object):
     def get_target(self, target):
         return 'iqn.1986-03.com.sun:02:00000-aaaa-bbbb-cccc-ddddd'
 
-    def create_lun(self, pool, project, lun, volsize, targetgroup,
-                   volblocksize, sparse, compression, logbias):
+    def create_lun(self, pool, project, lun, volsize, targetgroup, specs):
         out = {}
         if not self.host and not self.user:
             return out
 
-        out = {"logbias": logbias,
-               "compression": compression,
-               "status": "online",
+        out = {"status": "online",
                "lunguid": "600144F0F8FBD5BD000053CE53AB0001",
                "initiatorgroup": ["fake_initgrp"],
                "volsize": volsize,
                "pool": pool,
-               "volblocksize": volblocksize,
                "name": lun,
                "project": project,
-               "sparse": sparse,
                "targetgroup": targetgroup}
+        if specs:
+            out.update(specs)
 
         return out
 
@@ -213,105 +210,95 @@ class FakeZFSSA(object):
 
         return out
 
+    def get_initiator_initiatorgroup(self, initiator):
+        ret = ['test-init-grp1']
+        return ret
 
-class TestZFSSAISCSIDriver(test.TestCase):
 
-    test_vol = {
-        'name': 'cindervol',
-        'size': 1
-    }
+class FakeNFSZFSSA(FakeZFSSA):
+    """Fake ZFS SA for the NFS Driver
+    """
+    def set_webdav(self, https_path, auth_str):
+        self.webdavclient = https_path
 
-    test_snap = {
-        'name': 'cindersnap',
-        'volume_name': test_vol['name']
-    }
+    def create_share(self, pool, project, share, args):
+        out = {}
+        if not self.host and not self.user:
+            return out
 
-    test_vol_snap = {
-        'name': 'cindersnapvol',
-        'size': test_vol['size']
-    }
+        out = {"logbias": nfs_logbias,
+               "compression": nfs_compression,
+               "status": "online",
+               "pool": pool,
+               "name": share,
+               "project": project,
+               "mountpoint": '/export/nfs_share'}
 
-    def __init__(self, method):
-        super(TestZFSSAISCSIDriver, self).__init__(method)
+        return out
 
-    @mock.patch.object(iscsi, 'factory_zfssa')
-    def setUp(self, _factory_zfssa):
-        super(TestZFSSAISCSIDriver, self).setUp()
-        self._create_fake_config()
-        _factory_zfssa.return_value = FakeZFSSA()
-        self.drv = iscsi.ZFSSAISCSIDriver(configuration=self.configuration)
-        self.drv.do_setup({})
+    def get_share(self, pool, project, share):
+        out = {}
+        if not self.host and not self.user:
+            return out
 
-    def _create_fake_config(self):
-        self.configuration = mock.Mock(spec=conf.Configuration)
-        self.configuration.san_ip = '1.1.1.1'
-        self.configuration.san_login = 'user'
-        self.configuration.san_password = 'passwd'
-        self.configuration.zfssa_pool = 'pool'
-        self.configuration.zfssa_project = 'project'
-        self.configuration.zfssa_lun_volblocksize = '8k'
-        self.configuration.zfssa_lun_sparse = 'false'
-        self.configuration.zfssa_lun_logbias = 'latency'
-        self.configuration.zfssa_lun_compression = 'off'
-        self.configuration.zfssa_initiator_group = 'test-init-grp1'
-        self.configuration.zfssa_initiator = \
-            'iqn.1-0.org.deb:01:d7, iqn.1-0.org.deb:01:d9'
-        self.configuration.zfssa_initiator_user = ''
-        self.configuration.zfssa_initiator_password = ''
-        self.configuration.zfssa_target_group = 'test-target-grp1'
-        self.configuration.zfssa_target_user = ''
-        self.configuration.zfssa_target_password = ''
-        self.configuration.zfssa_target_portal = '1.1.1.1:3260'
-        self.configuration.zfssa_target_interfaces = 'e1000g0'
-        self.configuration.zfssa_rest_timeout = 60
+        out = {"logbias": nfs_logbias,
+               "compression": nfs_compression,
+               "encryption": "off",
+               "status": "online",
+               "pool": pool,
+               "name": share,
+               "project": project,
+               "mountpoint": '/export/nfs_share'}
 
-    def test_create_delete_volume(self):
-        self.drv.create_volume(self.test_vol)
-        self.drv.delete_volume(self.test_vol)
+        return out
 
-    def test_create_delete_snapshot(self):
-        self.drv.create_volume(self.test_vol)
-        self.drv.create_snapshot(self.test_snap)
-        self.drv.delete_snapshot(self.test_snap)
-        self.drv.delete_volume(self.test_vol)
+    def create_snapshot_of_volume_file(self, src_file="", dst_file=""):
+        out = {}
+        if not self.host and not self.user:
+            return out
+        out = {"status": 201}
 
-    def test_create_volume_from_snapshot(self):
-        self.drv.create_volume(self.test_vol)
-        self.drv.create_snapshot(self.test_snap)
-        self.drv.create_volume_from_snapshot(self.test_vol_snap,
-                                             self.test_snap)
-        self.drv.delete_volume(self.test_vol)
+        return out
 
-    def test_create_export(self):
-        self.drv.create_volume(self.test_vol)
-        self.drv.create_export({}, self.test_vol)
-        self.drv.delete_volume(self.test_vol)
+    def delete_snapshot_of_volume_file(self, src_file=""):
+        out = {}
+        if not self.host and not self.user:
+            return out
+        out = {"status": 204}
 
-    def test_remove_export(self):
-        self.drv.create_volume(self.test_vol)
-        self.drv.remove_export({}, self.test_vol)
-        self.drv.delete_volume(self.test_vol)
+        return out
 
-    def test_get_volume_stats(self):
-        self.drv.get_volume_stats(refresh=False)
+    def create_volume_from_snapshot_file(self, src_file="", dst_file="",
+                                         method='COPY'):
+        out = {}
+        if not self.host and not self.user:
+            return out
+        out = {"status": 202}
 
-    def test_extend_volume(self):
-        self.drv.create_volume(self.test_vol)
-        self.drv.extend_volume(self.test_vol, 3)
-        self.drv.delete_volume(self.test_vol)
+        return out
 
-    def tearDown(self):
-        super(TestZFSSAISCSIDriver, self).tearDown()
+    def modify_service(self, service, args):
+        out = {}
+        if not self.host and not self.user:
+            return out
+        out = {"service": {"<status>": "online"}}
+        return out
+
+    def enable_service(self, service):
+        out = {}
+        if not self.host and not self.user:
+            return out
+        out = {"service": {"<status>": "online"}}
+        return out
 
 
 class FakeAddIni2InitGrp(object):
-
     def get(self, path, **kwargs):
         result = client.RestResult()
         result.status = client.Status.OK
-        result.data = JSONEncoder().encode({'group':
-                                            {'initiators':
-                                             ['iqn.1-0.org.deb:01:d7']}})
+        result.data = json.JSONEncoder().encode({'group':
+                                                {'initiators':
+                                                 ['iqn.1-0.org.deb:01:d7']}})
         return result
 
     def put(self, path, body="", **kwargs):

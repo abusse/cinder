@@ -29,13 +29,13 @@ import json
 import os
 import stat
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from cinder.backup.driver import BackupDriver
+from cinder.backup import driver
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
+from cinder.i18n import _LE, _
 from cinder import utils
 
 LOG = logging.getLogger(__name__)
@@ -46,7 +46,8 @@ tsm_opts = [
                help='Volume prefix for the backup id when backing up to TSM'),
     cfg.StrOpt('backup_tsm_password',
                default='password',
-               help='TSM password for the running username'),
+               help='TSM password for the running username',
+               secret=True),
     cfg.BoolOpt('backup_tsm_compression',
                 default=True,
                 help='Enable or Disable compression for backups'),
@@ -249,18 +250,17 @@ def _cleanup_device_hardlink(hardlink_path, volume_path, volume_id):
                       hardlink_path,
                       run_as_root=True)
     except processutils.ProcessExecutionError as exc:
-        err = (_('backup: %(vol_id)s failed to remove backup hardlink'
-                 ' from %(vpath)s to %(bpath)s.\n'
-                 'stdout: %(out)s\n stderr: %(err)s.')
-               % {'vol_id': volume_id,
-                  'vpath': volume_path,
-                  'bpath': hardlink_path,
-                  'out': exc.stdout,
-                  'err': exc.stderr})
-        LOG.error(err)
+        LOG.error(_LE('backup: %(vol_id)s failed to remove backup hardlink '
+                      'from %(vpath)s to %(bpath)s.\n'
+                      'stdout: %(out)s\n stderr: %(err)s.'),
+                  {'vol_id': volume_id,
+                   'vpath': volume_path,
+                   'bpath': hardlink_path,
+                   'out': exc.stdout,
+                   'err': exc.stderr})
 
 
-class TSMBackupDriver(BackupDriver):
+class TSMBackupDriver(driver.BackupDriver):
     """Provides backup, restore and delete of volumes backup for TSM."""
 
     DRIVER_VERSION = '1.0.0'
@@ -369,10 +369,10 @@ class TSMBackupDriver(BackupDriver):
         volume_path, backup_mode = _get_volume_realpath(volume_file,
                                                         volume_id)
         LOG.debug('Starting backup of volume: %(volume_id)s to TSM,'
-                  ' volume path: %(volume_path)s, mode: %(mode)s.'
-                  % {'volume_id': volume_id,
-                     'volume_path': volume_path,
-                     'mode': backup_mode})
+                  ' volume path: %(volume_path)s, mode: %(mode)s.',
+                  {'volume_id': volume_id,
+                   'volume_path': volume_path,
+                   'mode': backup_mode})
 
         backup_path = _create_unique_device_link(backup_id,
                                                  volume_path,
@@ -413,7 +413,7 @@ class TSMBackupDriver(BackupDriver):
         finally:
             _cleanup_device_hardlink(backup_path, volume_path, volume_id)
 
-        LOG.debug('Backup %s finished.' % backup_id)
+        LOG.debug('Backup %s finished.', backup_id)
 
     def restore(self, backup, volume_id, volume_file):
         """Restore the given volume backup from TSM server.
@@ -432,7 +432,7 @@ class TSMBackupDriver(BackupDriver):
         LOG.debug('Starting restore of backup from TSM '
                   'to volume %(volume_id)s, '
                   'backup: %(backup_id)s, '
-                  'mode: %(mode)s.' %
+                  'mode: %(mode)s.',
                   {'volume_id': volume_id,
                    'backup_id': backup_id,
                    'mode': backup_mode})
@@ -474,9 +474,9 @@ class TSMBackupDriver(BackupDriver):
         finally:
             _cleanup_device_hardlink(restore_path, volume_path, volume_id)
 
-        LOG.debug('Restore %(backup_id)s to %(volume_id)s finished.'
-                  % {'backup_id': backup_id,
-                     'volume_id': volume_id})
+        LOG.debug('Restore %(backup_id)s to %(volume_id)s finished.',
+                  {'backup_id': backup_id,
+                   'volume_id': volume_id})
 
     def delete(self, backup):
         """Delete the given backup from TSM server.
@@ -528,14 +528,13 @@ class TSMBackupDriver(BackupDriver):
             # log error if tsm cannot delete the backup object
             # but do not raise exception so that cinder backup
             # object can be removed.
-            err = (_('delete: %(vol_id)s failed with '
-                     'stdout: %(out)s\n stderr: %(err)s')
-                   % {'vol_id': volume_id,
-                      'out': out,
-                      'err': err})
-            LOG.error(err)
+            LOG.error(_LE('delete: %(vol_id)s failed with '
+                          'stdout: %(out)s\n stderr: %(err)s'),
+                      {'vol_id': volume_id,
+                       'out': out,
+                       'err': err})
 
-        LOG.debug('Delete %s finished.' % backup['id'])
+        LOG.debug('Delete %s finished.', backup['id'])
 
 
 def get_backup_driver(context):

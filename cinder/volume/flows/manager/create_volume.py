@@ -12,18 +12,19 @@
 
 import traceback
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 import taskflow.engines
 from taskflow.patterns import linear_flow
-from taskflow.utils import misc
+from taskflow.types import failure as ft
 
 from cinder import exception
 from cinder import flow_utils
-from cinder.i18n import _
+from cinder.i18n import _, _LE, _LI
 from cinder.image import glance
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder.openstack.common import timeutils
+from cinder import objects
 from cinder import utils
 from cinder.volume.flows import common
 from cinder.volume import utils as volume_utils
@@ -100,7 +101,7 @@ class OnFailureRescheduleTask(flow_utils.CinderTask):
         request_spec['volume_id'] = volume_id
 
         LOG.debug("Volume %(volume_id)s: re-scheduling %(method)s "
-                  "attempt %(num)d due to %(reason)s" %
+                  "attempt %(num)d due to %(reason)s",
                   {'volume_id': volume_id,
                    'method': common.make_pretty_name(create_volume),
                    'num': num_attempts,
@@ -134,16 +135,25 @@ class OnFailureRescheduleTask(flow_utils.CinderTask):
             update = {
                 'status': 'creating',
                 'scheduled_at': timeutils.utcnow(),
+                'host': None
             }
-            LOG.debug("Updating volume %(volume_id)s with %(update)s." %
+            LOG.debug("Updating volume %(volume_id)s with %(update)s.",
                       {'update': update, 'volume_id': volume_id})
             self.db.volume_update(context, volume_id, update)
         except exception.CinderException:
             # Don't let resetting the status cause the rescheduling to fail.
-            LOG.exception(_("Volume %s: resetting 'creating' status failed."),
+            LOG.exception(_LE("Volume %s: resetting 'creating' "
+                              "status failed."),
                           volume_id)
 
     def revert(self, context, result, flow_failures, **kwargs):
+        # NOTE(dulek): Revert is occurring and manager need to know if
+        # rescheduling happened. We're injecting this information into
+        # exception that will be caught there. This is ugly and we need
+        # TaskFlow to support better way of returning data from reverted flow.
+        cause = list(flow_failures.values())[0]
+        cause.exception.rescheduled = False
+
         # Check if we have a cause which can tell us not to reschedule.
         for failure in flow_failures.values():
             if failure.check(*self.no_reschedule_types):
@@ -154,12 +164,13 @@ class OnFailureRescheduleTask(flow_utils.CinderTask):
         if self.reschedule_context:
             context = self.reschedule_context
             try:
-                cause = list(flow_failures.values())[0]
                 self._pre_reschedule(context, volume_id)
                 self._reschedule(context, cause, **kwargs)
                 self._post_reschedule(context, volume_id)
+                # Inject information that we rescheduled
+                cause.exception.rescheduled = True
             except exception.CinderException:
-                LOG.exception(_("Volume %s: rescheduling failed"), volume_id)
+                LOG.exception(_LE("Volume %s: rescheduling failed"), volume_id)
 
 
 class ExtractVolumeRefTask(flow_utils.CinderTask):
@@ -179,15 +190,14 @@ class ExtractVolumeRefTask(flow_utils.CinderTask):
         # In the future we might want to have a lock on the volume_id so that
         # the volume can not be deleted while its still being created?
         volume_ref = self.db.volume_get(context, volume_id)
-
         return volume_ref
 
     def revert(self, context, volume_id, result, **kwargs):
-        if isinstance(result, misc.Failure):
+        if isinstance(result, ft.Failure):
             return
 
         common.error_out_volume(context, self.db, volume_id)
-        LOG.error(_("Volume %s: create failed"), volume_id)
+        LOG.error(_LE("Volume %s: create failed"), volume_id)
 
 
 class ExtractVolumeSpecTask(flow_utils.CinderTask):
@@ -286,7 +296,7 @@ class ExtractVolumeSpecTask(flow_utils.CinderTask):
         return specs
 
     def revert(self, context, result, **kwargs):
-        if isinstance(result, misc.Failure):
+        if isinstance(result, ft.Failure):
             return
         volume_spec = result.get('volume_spec')
         # Restore the source volume status and set the volume to error status.
@@ -315,10 +325,9 @@ class NotifyVolumeActionTask(flow_utils.CinderTask):
             # If notification sending of volume database entry reading fails
             # then we shouldn't error out the whole workflow since this is
             # not always information that must be sent for volumes to operate
-            LOG.exception(_("Failed notifying about the volume"
-                            " action %(event)s for volume %(volume_id)s") %
-                          {'event': self.event_suffix,
-                           'volume_id': volume_id})
+            LOG.exception(_LE("Failed notifying about the volume"
+                              " action %(event)s for volume %(volume_id)s"),
+                          {'event': self.event_suffix, 'volume_id': volume_id})
 
 
 class CreateVolumeFromSpecTask(flow_utils.CinderTask):
@@ -356,18 +365,18 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
                 src_type = 'snapshot'
                 src_id = kwargs['snapshot_id']
                 snapshot_id = src_id
-                LOG.debug(log_template % {'src_type': src_type,
-                                          'src_id': src_id,
-                                          'vol_id': volume_id})
+                LOG.debug(log_template, {'src_type': src_type,
+                                         'src_id': src_id,
+                                         'vol_id': volume_id})
                 self.db.volume_glance_metadata_copy_to_volume(
                     context, volume_id, snapshot_id)
             elif kwargs.get('source_volid'):
                 src_type = 'source volume'
                 src_id = kwargs['source_volid']
                 source_volid = src_id
-                LOG.debug(log_template % {'src_type': src_type,
-                                          'src_id': src_id,
-                                          'vol_id': volume_id})
+                LOG.debug(log_template, {'src_type': src_type,
+                                         'src_id': src_id,
+                                         'vol_id': volume_id})
                 self.db.volume_glance_metadata_copy_from_volume_to_volume(
                     context,
                     source_volid,
@@ -376,9 +385,9 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
                 src_type = 'source replica'
                 src_id = kwargs['source_replicaid']
                 source_replicaid = src_id
-                LOG.debug(log_template % {'src_type': src_type,
-                                          'src_id': src_id,
-                                          'vol_id': volume_id})
+                LOG.debug(log_template, {'src_type': src_type,
+                                         'src_id': src_id,
+                                         'vol_id': volume_id})
                 self.db.volume_glance_metadata_copy_from_volume_to_volume(
                     context,
                     source_replicaid,
@@ -388,37 +397,43 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
                 src_id = kwargs['image_id']
                 image_id = src_id
                 image_meta = kwargs.get('image_meta', {})
-                LOG.debug(log_template % {'src_type': src_type,
-                                          'src_id': src_id,
-                                          'vol_id': volume_id})
+                LOG.debug(log_template, {'src_type': src_type,
+                                         'src_id': src_id,
+                                         'vol_id': volume_id})
                 self._capture_volume_image_metadata(context, volume_id,
                                                     image_id, image_meta)
+        except exception.GlanceMetadataNotFound:
+            # If volume is not created from image, No glance metadata
+            # would be available for that volume in
+            # volume glance metadata table
+            pass
         except exception.CinderException as ex:
-            LOG.exception(exception_template % {'src_type': src_type,
-                                                'src_id': src_id,
-                                                'vol_id': volume_id})
+            LOG.exception(exception_template, {'src_type': src_type,
+                                               'src_id': src_id,
+                                               'vol_id': volume_id})
             raise exception.MetadataCopyFailure(reason=ex)
 
     def _create_from_snapshot(self, context, volume_ref, snapshot_id,
                               **kwargs):
         volume_id = volume_ref['id']
-        snapshot_ref = self.db.snapshot_get(context, snapshot_id)
+        snapshot = objects.Snapshot.get_by_id(context, snapshot_id)
         model_update = self.driver.create_volume_from_snapshot(volume_ref,
-                                                               snapshot_ref)
+                                                               snapshot)
         # NOTE(harlowja): Subtasks would be useful here since after this
         # point the volume has already been created and further failures
         # will not destroy the volume (although they could in the future).
         make_bootable = False
         try:
             originating_vref = self.db.volume_get(context,
-                                                  snapshot_ref['volume_id'])
+                                                  snapshot.volume_id)
             make_bootable = originating_vref.bootable
         except exception.CinderException as ex:
-            LOG.exception(_("Failed fetching snapshot %(snapshot_id)s bootable"
-                            " flag using the provided glance snapshot "
-                            "%(snapshot_ref_id)s volume reference") %
+            LOG.exception(_LE("Failed fetching snapshot %(snapshot_id)s "
+                              "bootable"
+                              " flag using the provided glance snapshot "
+                              "%(snapshot_ref_id)s volume reference"),
                           {'snapshot_id': snapshot_id,
-                           'snapshot_ref_id': snapshot_ref['volume_id']})
+                           'snapshot_ref_id': snapshot.volume_id})
             raise exception.MetadataUpdateFailure(reason=ex)
         if make_bootable:
             self._handle_bootable_volume_glance_meta(context, volume_id,
@@ -430,8 +445,8 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
             LOG.debug('Marking volume %s as bootable.', volume_id)
             self.db.volume_update(context, volume_id, {'bootable': True})
         except exception.CinderException as ex:
-            LOG.exception(_("Failed updating volume %(volume_id)s bootable"
-                            " flag to true") % {'volume_id': volume_id})
+            LOG.exception(_LE("Failed updating volume %(volume_id)s bootable "
+                              "flag to true"), {'volume_id': volume_id})
             raise exception.MetadataUpdateFailure(reason=ex)
 
     def _create_from_source_volume(self, context, volume_ref,
@@ -479,34 +494,31 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
         copy_image_to_volume = self.driver.copy_image_to_volume
         volume_id = volume_ref['id']
         LOG.debug("Attempting download of %(image_id)s (%(image_location)s)"
-                  " to volume %(volume_id)s." %
+                  " to volume %(volume_id)s.",
                   {'image_id': image_id, 'volume_id': volume_id,
                    'image_location': image_location})
         try:
             copy_image_to_volume(context, volume_ref, image_service, image_id)
         except processutils.ProcessExecutionError as ex:
-            LOG.error(_("Failed to copy image %(image_id)s to volume: "
-                        "%(volume_id)s, error: %(error)s") %
-                      {'volume_id': volume_id,
-                       'error': ex.stderr, 'image_id': image_id})
+            LOG.exception(_LE("Failed to copy image %(image_id)s to volume: "
+                              "%(volume_id)s"),
+                          {'volume_id': volume_id, 'image_id': image_id})
             raise exception.ImageCopyFailure(reason=ex.stderr)
         except exception.ImageUnacceptable as ex:
-            LOG.error(_("Failed to copy image to volume: %(volume_id)s, "
-                        "error: %(error)s") % {'volume_id': volume_id,
-                                               'error': ex})
+            LOG.exception(_LE("Failed to copy image to volume: %(volume_id)s"),
+                          {'volume_id': volume_id})
             raise exception.ImageUnacceptable(ex)
         except Exception as ex:
-            LOG.error(_("Failed to copy image %(image_id)s to "
-                        "volume: %(volume_id)s, error: %(error)s") %
-                      {'volume_id': volume_id, 'error': ex,
-                       'image_id': image_id})
+            LOG.exception(_LE("Failed to copy image %(image_id)s to "
+                              "volume: %(volume_id)s"),
+                          {'volume_id': volume_id, 'image_id': image_id})
             if not isinstance(ex, exception.ImageCopyFailure):
                 raise exception.ImageCopyFailure(reason=ex)
             else:
                 raise
 
         LOG.debug("Downloaded image %(image_id)s (%(image_location)s)"
-                  " to volume %(volume_id)s successfully." %
+                  " to volume %(volume_id)s successfully.",
                   {'image_id': image_id, 'volume_id': volume_id,
                    'image_location': image_location})
 
@@ -543,7 +555,7 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
         volume_metadata = dict(property_metadata)
         volume_metadata.update(base_metadata)
         LOG.debug("Creating volume glance metadata for volume %(volume_id)s"
-                  " backed by image %(image_id)s with: %(vol_metadata)s." %
+                  " backed by image %(image_id)s with: %(vol_metadata)s.",
                   {'volume_id': volume_id, 'image_id': image_id,
                    'vol_metadata': volume_metadata})
         for (key, value) in volume_metadata.items():
@@ -557,7 +569,7 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
                            image_location, image_id, image_meta,
                            image_service, **kwargs):
         LOG.debug("Cloning %(volume_id)s from image %(image_id)s "
-                  " at location %(image_location)s." %
+                  " at location %(image_location)s.",
                   {'volume_id': volume_ref['id'],
                    'image_location': image_location, 'image_id': image_id})
         # Create the volume from an image.
@@ -565,8 +577,11 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
         # NOTE (singn): two params need to be returned
         # dict containing provider_location for cloned volume
         # and clone status.
-        model_update, cloned = self.driver.clone_image(
-            volume_ref, image_location, image_id, image_meta)
+        model_update, cloned = self.driver.clone_image(context,
+                                                       volume_ref,
+                                                       image_location,
+                                                       image_meta,
+                                                       image_service)
         if not cloned:
             # TODO(harlowja): what needs to be rolled back in the clone if this
             # volume create fails?? Likely this should be a subflow or broken
@@ -582,8 +597,8 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
                 volume_ref = self.db.volume_update(context,
                                                    volume_ref['id'], updates)
             except exception.CinderException:
-                LOG.exception(_("Failed updating volume %(volume_id)s with "
-                                "%(updates)s") %
+                LOG.exception(_LE("Failed updating volume %(volume_id)s with "
+                                  "%(updates)s"),
                               {'volume_id': volume_ref['id'],
                                'updates': updates})
             self._copy_image_to_volume(context, volume_ref,
@@ -606,16 +621,16 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
         # we can't do anything if the driver didn't init
         if not self.driver.initialized:
             driver_name = self.driver.__class__.__name__
-            LOG.error(_("Unable to create volume. "
-                        "Volume driver %s not initialized") % driver_name)
+            LOG.exception(_LE("Unable to create volume. "
+                              "Volume driver %s not initialized"), driver_name)
             # NOTE(flaper87): Set the error status before
             # raising any exception.
             self.db.volume_update(context, volume_id, dict(status='error'))
             raise exception.DriverNotInitialized()
 
         create_type = volume_spec.pop('type', None)
-        LOG.info(_("Volume %(volume_id)s: being created as %(create_type)s "
-                   "with specification: %(volume_spec)s") %
+        LOG.info(_LI("Volume %(volume_id)s: being created as %(create_type)s "
+                     "with specification: %(volume_spec)s"),
                  {'volume_spec': volume_spec, 'volume_id': volume_id,
                   'create_type': create_type})
         if create_type == 'raw':
@@ -648,8 +663,8 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
             # If somehow the update failed we want to ensure that the
             # failure is logged (but not try rescheduling since the volume at
             # this point has been created).
-            LOG.exception(_("Failed updating model of volume %(volume_id)s"
-                            " with creation provided model %(model)s") %
+            LOG.exception(_LE("Failed updating model of volume %(volume_id)s "
+                              "with creation provided model %(model)s"),
                           {'volume_id': volume_id, 'model': model_update})
             raise
 
@@ -691,22 +706,21 @@ class CreateVolumeOnFinishTask(NotifyVolumeActionTask):
             # Now use the parent to notify.
             super(CreateVolumeOnFinishTask, self).execute(context, volume_ref)
         except exception.CinderException:
-            LOG.exception(_("Failed updating volume %(volume_id)s with "
-                            "%(update)s") % {'volume_id': volume_id,
-                                             'update': update})
+            LOG.exception(_LE("Failed updating volume %(volume_id)s with "
+                              "%(update)s"), {'volume_id': volume_id,
+                                              'update': update})
         # Even if the update fails, the volume is ready.
-        msg = _("Volume %(volume_name)s (%(volume_id)s): created successfully")
-        LOG.info(msg % {
-            'volume_name': volume_spec['volume_name'],
-            'volume_id': volume_id,
-        })
+        LOG.info(_LI("Volume %(volume_name)s (%(volume_id)s): "
+                     "created successfully"),
+                 {'volume_name': volume_spec['volume_name'],
+                  'volume_id': volume_id})
 
 
 def get_flow(context, db, driver, scheduler_rpcapi, host, volume_id,
              allow_reschedule, reschedule_context, request_spec,
              filter_properties, snapshot_id=None, image_id=None,
              source_volid=None, source_replicaid=None,
-             consistencygroup_id=None):
+             consistencygroup_id=None, cgsnapshot_id=None):
     """Constructs and returns the manager entrypoint flow.
 
     This flow will do the following:
@@ -738,6 +752,7 @@ def get_flow(context, db, driver, scheduler_rpcapi, host, volume_id,
         'volume_id': volume_id,
         'source_replicaid': source_replicaid,
         'consistencygroup_id': consistencygroup_id,
+        'cgsnapshot_id': cgsnapshot_id,
     }
 
     volume_flow.add(ExtractVolumeRefTask(db, host))

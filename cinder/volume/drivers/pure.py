@@ -15,33 +15,48 @@
 """
 Volume driver for Pure Storage FlashArray storage system.
 
-This driver requires Purity version 3.4.0 or later.
+This driver requires Purity version 4.0.0 or later.
 """
 
-import cookielib
-import json
-import urllib2
+import math
+import re
+import uuid
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import units
 
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import excutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder.openstack.common import units
+from cinder.i18n import _, _LE, _LI, _LW
 from cinder import utils
 from cinder.volume.drivers.san import san
+from cinder.volume import utils as volume_utils
+
+try:
+    import purestorage
+except ImportError:
+    purestorage = None
 
 LOG = logging.getLogger(__name__)
 
 PURE_OPTS = [
-    cfg.StrOpt("pure_api_token", default=None,
+    cfg.StrOpt("pure_api_token",
+               default=None,
                help="REST API authorization token."),
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(PURE_OPTS)
+
+INVALID_CHARACTERS = re.compile(r"[^-a-zA-Z0-9]")
+GENERATED_NAME = re.compile(r".*-[a-f0-9]{32}-cinder$")
+
+CHAP_SECRET_KEY = "PURE_TARGET_CHAP_SECRET"
+
+ERR_MSG_NOT_EXIST = "does not exist"
+ERR_MSG_PENDING_ERADICATION = "has been destroyed"
 
 
 def _get_vol_name(volume):
@@ -51,14 +66,50 @@ def _get_vol_name(volume):
 
 def _get_snap_name(snapshot):
     """Return the name of the snapshot that Purity will use."""
-    return "{0}-cinder.{1}".format(snapshot["volume_name"],
-                                   snapshot["name"])
+    return "%s-cinder.%s" % (snapshot["volume_name"], snapshot["name"])
+
+
+def _get_pgroup_name_from_id(id):
+    return "consisgroup-%s-cinder" % id
+
+
+def _get_pgroup_snap_suffix(cgsnapshot):
+    return "cgsnapshot-%s-cinder" % cgsnapshot.id
+
+
+def _get_pgroup_snap_name(cgsnapshot):
+    """Return the name of the pgroup snapshot that Purity will use"""
+    return "%s.%s" % (_get_pgroup_name_from_id(cgsnapshot.consistencygroup_id),
+                      _get_pgroup_snap_suffix(cgsnapshot))
+
+
+def _get_pgroup_vol_snap_name(snapshot):
+    """Return the name of the snapshot that Purity will use for a volume."""
+    cg_name = _get_pgroup_name_from_id(snapshot.cgsnapshot.consistencygroup_id)
+    cgsnapshot_id = _get_pgroup_snap_suffix(snapshot.cgsnapshot)
+    volume_name = snapshot.volume_name
+    return "%s.%s.%s-cinder" % (cg_name, cgsnapshot_id, volume_name)
+
+
+def _generate_purity_host_name(name):
+    """Return a valid Purity host name based on the name passed in."""
+    if len(name) > 23:
+        name = name[0:23]
+    name = INVALID_CHARACTERS.sub("-", name)
+    name = name.lstrip("-")
+    return "{name}-{uuid}-cinder".format(name=name, uuid=uuid.uuid4().hex)
+
+
+def _generate_chap_secret():
+    return volume_utils.generate_password()
 
 
 class PureISCSIDriver(san.SanISCSIDriver):
     """Performs volume management on Pure Storage FlashArray."""
 
-    VERSION = "1.0.0"
+    VERSION = "2.0.6"
+
+    SUPPORTED_REST_API_VERSIONS = ['1.2', '1.3', '1.4']
 
     def __init__(self, *args, **kwargs):
         execute = kwargs.pop("execute", utils.execute)
@@ -71,11 +122,18 @@ class PureISCSIDriver(san.SanISCSIDriver):
 
     def do_setup(self, context):
         """Performs driver initialization steps that could raise exceptions."""
-        # Raises PureDriverException if unable to connect and PureAPIException
+        if purestorage is None:
+            msg = _("Missing 'purestorage' python module, ensure the library"
+                    " is installed and available.")
+            raise exception.PureDriverException(msg)
+
+        # Raises PureDriverException if unable to connect and PureHTTPError
         # if unable to authenticate.
-        self._array = FlashArray(
+        purestorage.FlashArray.supported_rest_versions = \
+            self.SUPPORTED_REST_API_VERSIONS
+        self._array = purestorage.FlashArray(
             self.configuration.san_ip,
-            self.configuration.pure_api_token)
+            api_token=self.configuration.pure_api_token)
         self._iscsi_port = self._choose_target_iscsi_port()
 
     def check_for_setup_error(self):
@@ -89,16 +147,31 @@ class PureISCSIDriver(san.SanISCSIDriver):
         vol_name = _get_vol_name(volume)
         vol_size = volume["size"] * units.Gi
         self._array.create_volume(vol_name, vol_size)
+
+        if volume['consistencygroup_id']:
+            self._add_volume_to_consistency_group(
+                volume['consistencygroup_id'],
+                vol_name
+            )
         LOG.debug("Leave PureISCSIDriver.create_volume.")
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
         LOG.debug("Enter PureISCSIDriver.create_volume_from_snapshot.")
         vol_name = _get_vol_name(volume)
-        snap_name = _get_snap_name(snapshot)
+        if snapshot['cgsnapshot_id']:
+            snap_name = _get_pgroup_vol_snap_name(snapshot)
+        else:
+            snap_name = _get_snap_name(snapshot)
+
         self._array.copy_volume(snap_name, vol_name)
         self._extend_if_needed(vol_name, snapshot["volume_size"],
                                volume["size"])
+        if volume['consistencygroup_id']:
+            self._add_volume_to_consistency_group(
+                volume['consistencygroup_id'],
+                vol_name
+            )
         LOG.debug("Leave PureISCSIDriver.create_volume_from_snapshot.")
 
     def create_cloned_volume(self, volume, src_vref):
@@ -108,6 +181,13 @@ class PureISCSIDriver(san.SanISCSIDriver):
         src_name = _get_vol_name(src_vref)
         self._array.copy_volume(src_name, vol_name)
         self._extend_if_needed(vol_name, src_vref["size"], volume["size"])
+
+        if volume['consistencygroup_id']:
+            self._add_volume_to_consistency_group(
+                volume['consistencygroup_id'],
+                vol_name
+            )
+
         LOG.debug("Leave PureISCSIDriver.create_cloned_volume.")
 
     def _extend_if_needed(self, vol_name, src_size, vol_size):
@@ -117,25 +197,31 @@ class PureISCSIDriver(san.SanISCSIDriver):
             self._array.extend_volume(vol_name, vol_size)
 
     def delete_volume(self, volume):
-        """Deletes a volume."""
+        """Disconnect all hosts and delete the volume"""
         LOG.debug("Enter PureISCSIDriver.delete_volume.")
         vol_name = _get_vol_name(volume)
         try:
+            connected_hosts = \
+                self._array.list_volume_private_connections(vol_name)
+            for host_info in connected_hosts:
+                host_name = host_info["host"]
+                self._disconnect_host(host_name, vol_name)
             self._array.destroy_volume(vol_name)
-        except exception.PureAPIException as err:
+        except purestorage.PureHTTPError as err:
             with excutils.save_and_reraise_exception() as ctxt:
-                if err.kwargs["code"] == 400:
+                if err.code == 400 and \
+                        ERR_MSG_NOT_EXIST in err.text:
                     # Happens if the volume does not exist.
                     ctxt.reraise = False
-                    LOG.error(_("Volume deletion failed with message: {0}"
-                                ).format(err.msg))
+                    LOG.warn(_LW("Volume deletion failed with message: %s"),
+                             err.text)
         LOG.debug("Leave PureISCSIDriver.delete_volume.")
 
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
         LOG.debug("Enter PureISCSIDriver.create_snapshot.")
         vol_name, snap_suff = _get_snap_name(snapshot).split(".")
-        self._array.create_snapshot(vol_name, snap_suff)
+        self._array.create_snapshot(vol_name, suffix=snap_suff)
         LOG.debug("Leave PureISCSIDriver.create_snapshot.")
 
     def delete_snapshot(self, snapshot):
@@ -144,20 +230,26 @@ class PureISCSIDriver(san.SanISCSIDriver):
         snap_name = _get_snap_name(snapshot)
         try:
             self._array.destroy_volume(snap_name)
-        except exception.PureAPIException as err:
+        except purestorage.PureHTTPError as err:
             with excutils.save_and_reraise_exception() as ctxt:
-                if err.kwargs["code"] == 400:
+                if err.code == 400:
                     # Happens if the snapshot does not exist.
                     ctxt.reraise = False
-                    LOG.error(_("Snapshot deletion failed with message: {0}"
-                                ).format(err.msg))
+                    LOG.error(_LE("Snapshot deletion failed with message:"
+                                  " %s"), err.text)
         LOG.debug("Leave PureISCSIDriver.delete_snapshot.")
 
-    def initialize_connection(self, volume, connector):
+    def ensure_export(self, context, volume):
+        pass
+
+    def create_export(self, context, volume):
+        pass
+
+    def initialize_connection(self, volume, connector, initiator_data=None):
         """Allow connection to connector and return connection info."""
         LOG.debug("Enter PureISCSIDriver.initialize_connection.")
         target_port = self._get_target_iscsi_port()
-        connection = self._connect(volume, connector)
+        connection = self._connect(volume, connector, initiator_data)
         properties = {
             "driver_volume_type": "iscsi",
             "data": {
@@ -168,8 +260,17 @@ class PureISCSIDriver(san.SanISCSIDriver):
                 "access_mode": "rw",
             },
         }
-        LOG.debug("Leave PureISCSIDriver.initialize_connection. "
-                  "Return value: " + str(properties))
+
+        if self.configuration.use_chap_auth:
+            properties["data"]["auth_method"] = "CHAP"
+            properties["data"]["auth_username"] = connection["auth_username"]
+            properties["data"]["auth_password"] = connection["auth_password"]
+
+        initiator_update = connection.get("initiator_update", False)
+        if initiator_update:
+            properties["initiator_update"] = initiator_update
+
+        LOG.debug("Leave PureISCSIDriver.initialize_connection.")
         return properties
 
     def _get_target_iscsi_port(self):
@@ -178,12 +279,15 @@ class PureISCSIDriver(san.SanISCSIDriver):
             self._run_iscsiadm_bare(["-m", "discovery", "-t", "sendtargets",
                                      "-p", self._iscsi_port["portal"]])
         except processutils.ProcessExecutionError as err:
-            LOG.warn(_("iSCSI discovery of port {0[name]} at {0[portal]} "
-                       "failed with error: {1}").format(self._iscsi_port,
-                                                        err.stderr))
+            LOG.warn(_LW("iSCSI discovery of port %(port_name)s at "
+                         "%(port_portal)s failed with error: %(err_msg)s"),
+                     {"port_name": self._iscsi_port["name"],
+                      "port_portal": self._iscsi_port["portal"],
+                      "err_msg": err.stderr})
             self._iscsi_port = self._choose_target_iscsi_port()
         return self._iscsi_port
 
+    @utils.retry(exception.PureDriverException, retries=3)
     def _choose_target_iscsi_port(self):
         """Find a reachable iSCSI-enabled port on target array."""
         ports = self._array.list_ports()
@@ -194,51 +298,153 @@ class PureISCSIDriver(san.SanISCSIDriver):
                                          "-t", "sendtargets",
                                          "-p", port["portal"]])
             except processutils.ProcessExecutionError as err:
-                LOG.debug(("iSCSI discovery of port {0[name]} at {0[portal]} "
-                           "failed with error: {1}").format(port, err.stderr))
+                LOG.debug(("iSCSI discovery of port %(port_name)s at "
+                           "%(port_portal)s failed with error: %(err_msg)s"),
+                          {"port_name": port["name"],
+                           "port_portal": port["portal"],
+                           "err_msg": err.stderr})
             else:
-                LOG.info(_("Using port {0[name]} on the array at {0[portal]} "
-                           "for iSCSI connectivity.").format(port))
+                LOG.info(_LI("Using port %(name)s on the array at %(portal)s "
+                             "for iSCSI connectivity."),
+                         {"name": port["name"], "portal": port["portal"]})
                 return port
         raise exception.PureDriverException(
             reason=_("No reachable iSCSI-enabled ports on target array."))
 
-    def _connect(self, volume, connector):
-        """Connect the host and volume; return dict describing connection."""
-        host_name = self._get_host_name(connector)
-        vol_name = _get_vol_name(volume)
-        return self._array.connect_host(host_name, vol_name)
+    def _get_chap_credentials(self, host, data):
+        initiator_updates = None
+        username = host
+        password = None
+        if data:
+            for d in data:
+                if d["key"] == CHAP_SECRET_KEY:
+                    password = d["value"]
+                    break
+        if not password:
+            password = _generate_chap_secret()
+            initiator_updates = {
+                "set_values": {
+                    CHAP_SECRET_KEY: password
+                }
+            }
+        return username, password, initiator_updates
 
-    def _get_host_name(self, connector):
-        """Return dictionary describing the Purity host with initiator IQN."""
+    @utils.synchronized('PureISCSIDriver._connect', external=True)
+    def _connect(self, volume, connector, initiator_data):
+        """Connect the host and volume; return dict describing connection."""
+        connection = None
+        iqn = connector["initiator"]
+
+        if self.configuration.use_chap_auth:
+            (chap_username, chap_password, initiator_update) = \
+                self._get_chap_credentials(connector['host'], initiator_data)
+
+        vol_name = _get_vol_name(volume)
+        host = self._get_host(connector)
+
+        if host:
+            host_name = host["name"]
+            LOG.info(_LI("Re-using existing purity host %(host_name)r"),
+                     {"host_name": host_name})
+            if self.configuration.use_chap_auth:
+                if not GENERATED_NAME.match(host_name):
+                    LOG.error(_LE("Purity host %(host_name)s is not managed "
+                                  "by Cinder and can't have CHAP credentials "
+                                  "modified. Remove IQN %(iqn)s from the host "
+                                  "to resolve this issue."),
+                              {"host_name": host_name,
+                               "iqn": connector["initiator"]})
+                    raise exception.PureDriverException(
+                        reason=_("Unable to re-use a host that is not "
+                                 "managed by Cinder with use_chap_auth=True,"))
+                elif chap_username is None or chap_password is None:
+                    LOG.error(_LE("Purity host %(host_name)s is managed by "
+                                  "Cinder but CHAP credentials could not be "
+                                  "retrieved from the Cinder database."),
+                              {"host_name": host_name})
+                    raise exception.PureDriverException(
+                        reason=_("Unable to re-use host with unknown CHAP "
+                                 "credentials configured."))
+        else:
+            host_name = _generate_purity_host_name(connector["host"])
+            LOG.info(_LI("Creating host object %(host_name)r with IQN:"
+                         " %(iqn)s."), {"host_name": host_name, "iqn": iqn})
+            self._array.create_host(host_name, iqnlist=[iqn])
+
+            if self.configuration.use_chap_auth:
+                self._array.set_host(host_name,
+                                     host_user=chap_username,
+                                     host_password=chap_password)
+
+        try:
+            connection = self._array.connect_host(host_name, vol_name)
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 400 and
+                        "Connection already exists" in err.text):
+                    # Happens if the volume is already connected to the host.
+                    ctxt.reraise = False
+                    LOG.warn(_LW("Volume connection already exists with "
+                                 "message: %s"), err.text)
+                    # Get the info for the existing connection
+                    connected_hosts = \
+                        self._array.list_volume_private_connections(vol_name)
+                    for host_info in connected_hosts:
+                        if host_info["host"] == host_name:
+                            connection = host_info
+                            break
+        if not connection:
+            raise exception.PureDriverException(
+                reason=_("Unable to connect or find connection to host"))
+
+        if self.configuration.use_chap_auth:
+            connection["auth_username"] = chap_username
+            connection["auth_password"] = chap_password
+
+            if initiator_update:
+                connection["initiator_update"] = initiator_update
+
+        return connection
+
+    def _get_host(self, connector):
+        """Return dict describing existing Purity host object or None."""
         hosts = self._array.list_hosts()
         for host in hosts:
             if connector["initiator"] in host["iqn"]:
-                return host["name"]
-        raise exception.PureDriverException(
-            reason=(_("No host object on target array with IQN: ") +
-                    connector["initiator"]))
+                return host
+        return None
 
     def terminate_connection(self, volume, connector, **kwargs):
         """Terminate connection."""
         LOG.debug("Enter PureISCSIDriver.terminate_connection.")
         vol_name = _get_vol_name(volume)
-        message = _("Disconnection failed with message: {0}")
-        try:
-            host_name = self._get_host_name(connector)
-        except exception.PureDriverException as err:
-            # Happens if the host object is missing.
-            LOG.error(message.format(err.msg))
+        host = self._get_host(connector)
+        if host:
+            host_name = host["name"]
+            self._disconnect_host(host_name, vol_name)
         else:
-            try:
-                self._array.disconnect_host(host_name, vol_name)
-            except exception.PureAPIException as err:
-                with excutils.save_and_reraise_exception() as ctxt:
-                    if err.kwargs["code"] == 400:
-                        # Happens if the host and volume are not connected.
-                        ctxt.reraise = False
-                        LOG.error(message.format(err.msg))
+            LOG.error(_LE("Unable to find host object in Purity with IQN: "
+                          "%(iqn)s."), {"iqn": connector["initiator"]})
         LOG.debug("Leave PureISCSIDriver.terminate_connection.")
+
+    def _disconnect_host(self, host_name, vol_name):
+        LOG.debug("Enter PureISCSIDriver._disconnect_host.")
+        try:
+            self._array.disconnect_host(host_name, vol_name)
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if err.code == 400:
+                    # Happens if the host and volume are not connected.
+                    ctxt.reraise = False
+                    LOG.error(_LE("Disconnection failed with message: "
+                                  "%(msg)s."), {"msg": err.text})
+        if (GENERATED_NAME.match(host_name) and
+            not self._array.list_host_connections(host_name,
+                                                  private=True)):
+            LOG.info(_LI("Deleting unneeded host %(host_name)r."),
+                     {"host_name": host_name})
+            self._array.delete_host(host_name)
+        LOG.debug("Leave PureISCSIDriver._disconnect_host.")
 
     def get_volume_stats(self, refresh=False):
         """Return the current state of the volume service.
@@ -255,18 +461,38 @@ class PureISCSIDriver(san.SanISCSIDriver):
 
     def _update_stats(self):
         """Set self._stats with relevant information."""
-        info = self._array.get_array(space=True)
-        total = float(info["capacity"]) / units.Gi
-        free = float(info["capacity"] - info["total"]) / units.Gi
+        info = self._array.get(space=True)
+        total_capacity = float(info["capacity"]) / units.Gi
+        used_space = float(info["total"]) / units.Gi
+        free_space = float(total_capacity - used_space)
+        provisioned_space = float(self._get_provisioned_space()) / units.Gi
+        # If array is empty we can not calculate a max oversubscription ratio.
+        # In this case we choose 20 as a default value for the ratio.  Once
+        # some volumes are actually created and some data is stored on the
+        # array a much more accurate number will be presented based on current
+        # usage.
+        if used_space == 0 or provisioned_space == 0:
+            thin_provisioning = 20
+        else:
+            thin_provisioning = provisioned_space / used_space
         data = {"volume_backend_name": self._backend_name,
                 "vendor_name": "Pure Storage",
                 "driver_version": self.VERSION,
                 "storage_protocol": "iSCSI",
-                "total_capacity_gb": total,
-                "free_capacity_gb": free,
+                "total_capacity_gb": total_capacity,
+                "free_capacity_gb": free_space,
                 "reserved_percentage": 0,
+                "consistencygroup_support": True,
+                "thin_provisioning_support": True,
+                "provisioned_capacity": provisioned_space,
+                "max_over_subscription_ratio": thin_provisioning
                 }
         self._stats = data
+
+    def _get_provisioned_space(self):
+        """Sum up provisioned size of all volumes on array"""
+        volumes = self._array.list_volumes(pending=True)
+        return sum(item["size"] for item in volumes)
 
     def extend_volume(self, volume, new_size):
         """Extend volume to new_size."""
@@ -276,127 +502,224 @@ class PureISCSIDriver(san.SanISCSIDriver):
         self._array.extend_volume(vol_name, new_size)
         LOG.debug("Leave PureISCSIDriver.extend_volume.")
 
+    def _add_volume_to_consistency_group(self, consistencygroup_id, vol_name):
+        pgroup_name = _get_pgroup_name_from_id(consistencygroup_id)
+        self._array.set_pgroup(pgroup_name, addvollist=[vol_name])
 
-class FlashArray(object):
-    """Wrapper for Pure Storage REST API."""
-    SUPPORTED_REST_API_VERSIONS = ["1.2", "1.1", "1.0"]
+    def create_consistencygroup(self, context, group):
+        """Creates a consistencygroup."""
+        LOG.debug("Enter PureISCSIDriver.create_consistencygroup")
 
-    def __init__(self, target, api_token):
-        cookie_handler = urllib2.HTTPCookieProcessor(cookielib.CookieJar())
-        self._opener = urllib2.build_opener(cookie_handler)
-        self._target = target
-        self._rest_version = self._choose_rest_version()
-        self._root_url = "https://{0}/api/{1}/".format(target,
-                                                       self._rest_version)
-        self._api_token = api_token
-        self._start_session()
+        self._array.create_pgroup(_get_pgroup_name_from_id(group.id))
 
-    def _http_request(self, method, path, data=None, reestablish_session=True):
-        """Perform HTTP request for REST API."""
-        req = urllib2.Request(self._root_url + path,
-                              headers={"Content-Type": "application/json"})
-        req.get_method = lambda: method
-        body = json.dumps(data)
-        try:
-            # Raises urllib2.HTTPError if response code != 200
-            response = self._opener.open(req, body)
-        except urllib2.HTTPError as err:
-            if (reestablish_session and err.code == 401):
-                self._start_session()
-                return self._http_request(method, path, data,
-                                          reestablish_session=False)
-            elif err.code == 450:
-                # Purity REST API version is bad
-                new_version = self._choose_rest_version()
-                if new_version == self._rest_version:
-                    raise exception.PureAPIException(
-                        code=err.code,
-                        reason=(_("Unable to find usable REST API version. "
-                                  "Response from Pure Storage REST API: ") +
-                                err.read()))
-                self._rest_version = new_version
-                self._root_url = "https://{0}/api/{1}/".format(
-                    self._target,
-                    self._rest_version)
-                return self._http_request(method, path, data)
-            else:
-                raise exception.PureAPIException(code=err.code,
-                                                 reason=err.read())
-        except urllib2.URLError as err:
-            # Error outside scope of HTTP status codes,
-            # e.g., unable to resolve domain name
-            raise exception.PureDriverException(
-                reason=_("Unable to connect to {0!r}. Check san_ip."
-                         ).format(self._target))
+        model_update = {'status': 'available'}
+
+        LOG.debug("Leave PureISCSIDriver.create_consistencygroup")
+        return model_update
+
+    def create_consistencygroup_from_src(self, context, group, volumes,
+                                         cgsnapshot=None, snapshots=None):
+        LOG.debug("Enter PureISCSIDriver.create_consistencygroup_from_src")
+
+        if cgsnapshot and snapshots:
+            self.create_consistencygroup(context, group)
+            for volume, snapshot in zip(volumes, snapshots):
+                self.create_volume_from_snapshot(volume, snapshot)
         else:
-            content = response.read()
-            if "application/json" in response.info().get('Content-Type'):
-                return json.loads(content)
-            raise exception.PureAPIException(
-                reason=(_("Response not in JSON: ") + content))
+            msg = _("create_consistencygroup_from_src only supports a"
+                    " cgsnapshot source, other sources cannot be used.")
+            raise exception.InvalidInput(msg)
 
-    def _choose_rest_version(self):
-        """Return a REST API version."""
-        self._root_url = "https://{0}/api/".format(self._target)
-        data = self._http_request("GET", "api_version")
-        available_versions = data["version"]
-        available_versions.sort(reverse=True)
-        for version in available_versions:
-            if version in FlashArray.SUPPORTED_REST_API_VERSIONS:
-                return version
-        raise exception.PureDriverException(
-            reason=_("All REST API versions supported by this version of the "
-                     "Pure Storage iSCSI driver are unavailable on array."))
+        LOG.debug("Leave PureISCSIDriver.create_consistencygroup_from_src")
+        return None, None
 
-    def _start_session(self):
-        """Start a REST API session."""
-        self._http_request("POST", "auth/session",
-                           {"api_token": self._api_token},
-                           reestablish_session=False)
+    def delete_consistencygroup(self, context, group):
+        """Deletes a consistency group."""
+        LOG.debug("Enter PureISCSIDriver.delete_consistencygroup")
 
-    def get_array(self, **kwargs):
-        """Return a dictionary containing information about the array."""
-        return self._http_request("GET", "array", kwargs)
+        try:
+            self._array.destroy_pgroup(_get_pgroup_name_from_id(group.id))
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 400 and
+                        (ERR_MSG_PENDING_ERADICATION in err.text or
+                         ERR_MSG_NOT_EXIST in err.text)):
+                    # Treat these as a "success" case since we are trying
+                    # to delete them anyway.
+                    ctxt.reraise = False
+                    LOG.warning(_LW("Unable to delete Protection Group: %s"),
+                                err.text)
 
-    def create_volume(self, name, size):
-        """Create a volume and return a dictionary describing it."""
-        return self._http_request("POST", "volume/{0}".format(name),
-                                  {"size": size})
+        volumes = self.db.volume_get_all_by_group(context, group.id)
 
-    def copy_volume(self, source, dest):
-        """Clone a volume and return a dictionary describing the new volume."""
-        return self._http_request("POST", "volume/{0}".format(dest),
-                                  {"source": source})
+        for volume in volumes:
+            self.delete_volume(volume)
+            volume.status = 'deleted'
 
-    def create_snapshot(self, volume, suffix):
-        """Create a snapshot and return a dictionary describing it."""
-        data = {"source": [volume], "suffix": suffix, "snap": True}
-        return self._http_request("POST", "volume", data)[0]
+        model_update = {'status': group['status']}
 
-    def destroy_volume(self, volume):
-        """Destroy an existing volume or snapshot."""
-        return self._http_request("DELETE", "volume/{0}".format(volume))
+        LOG.debug("Leave PureISCSIDriver.delete_consistencygroup")
+        return model_update, volumes
 
-    def extend_volume(self, volume, size):
-        """Extend a volume to a new, larger size."""
-        return self._http_request("PUT", "volume/{0}".format(volume),
-                                  {"size": size, "truncate": False})
+    def update_consistencygroup(self, context, group,
+                                add_volumes=None, remove_volumes=None):
+        LOG.debug("Enter PureISCSIDriver.update_consistencygroup")
 
-    def list_hosts(self, **kwargs):
-        """Return a list of dictionaries describing each host."""
-        return self._http_request("GET", "host", kwargs)
+        pgroup_name = _get_pgroup_name_from_id(group.id)
+        if add_volumes:
+            addvollist = [_get_vol_name(volume) for volume in add_volumes]
+        else:
+            addvollist = []
 
-    def connect_host(self, host, volume, **kwargs):
-        """Create a connection between a host and a volume."""
-        return self._http_request("POST",
-                                  "host/{0}/volume/{1}".format(host, volume),
-                                  kwargs)
+        if remove_volumes:
+            remvollist = [_get_vol_name(volume) for volume in remove_volumes]
+        else:
+            remvollist = []
 
-    def disconnect_host(self, host, volume):
-        """Delete a connection between a host and a volume."""
-        return self._http_request("DELETE",
-                                  "host/{0}/volume/{1}".format(host, volume))
+        self._array.set_pgroup(pgroup_name, addvollist=addvollist,
+                               remvollist=remvollist)
 
-    def list_ports(self, **kwargs):
-        """Return a list of dictionaries describing ports."""
-        return self._http_request("GET", "port", kwargs)
+        LOG.debug("Leave PureISCSIDriver.update_consistencygroup")
+        return None, None, None
+
+    def create_cgsnapshot(self, context, cgsnapshot):
+        """Creates a cgsnapshot."""
+        LOG.debug("Enter PureISCSIDriver.create_cgsnapshot")
+
+        pgroup_name = _get_pgroup_name_from_id(cgsnapshot.consistencygroup_id)
+        pgsnap_suffix = _get_pgroup_snap_suffix(cgsnapshot)
+        self._array.create_pgroup_snapshot(pgroup_name, suffix=pgsnap_suffix)
+
+        snapshots = self.db.snapshot_get_all_for_cgsnapshot(
+            context, cgsnapshot.id)
+
+        for snapshot in snapshots:
+            snapshot.status = 'available'
+
+        model_update = {'status': 'available'}
+
+        LOG.debug("Leave PureISCSIDriver.create_cgsnapshot")
+        return model_update, snapshots
+
+    def delete_cgsnapshot(self, context, cgsnapshot):
+        """Deletes a cgsnapshot."""
+        LOG.debug("Enter PureISCSIDriver.delete_cgsnapshot")
+
+        pgsnap_name = _get_pgroup_snap_name(cgsnapshot)
+
+        try:
+            # FlashArray.destroy_pgroup is also used for deleting
+            # pgroup snapshots. The underlying REST API is identical.
+            self._array.destroy_pgroup(pgsnap_name)
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 400 and
+                        (ERR_MSG_PENDING_ERADICATION in err.text or
+                         ERR_MSG_NOT_EXIST in err.text)):
+                    # Treat these as a "success" case since we are trying
+                    # to delete them anyway.
+                    ctxt.reraise = False
+                    LOG.warning(_LW("Unable to delete Protection Group "
+                                    "Snapshot: %s"), err.text)
+
+        snapshots = self.db.snapshot_get_all_for_cgsnapshot(
+            context, cgsnapshot.id)
+
+        for snapshot in snapshots:
+            snapshot.status = 'deleted'
+
+        model_update = {'status': cgsnapshot.status}
+
+        LOG.debug("Leave PureISCSIDriver.delete_cgsnapshot")
+        return model_update, snapshots
+
+    def _validate_manage_existing_ref(self, existing_ref):
+        """Ensure that an existing_ref is valid and return volume info
+
+        If the ref is not valid throw a ManageExistingInvalidReference
+        exception with an appropriate error.
+        """
+        if "name" not in existing_ref or not existing_ref["name"]:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("PureISCSIDriver manage_existing requires a 'name'"
+                         " key to identify an existing volume."))
+
+        ref_vol_name = existing_ref['name']
+
+        try:
+            volume_info = self._array.get_volume(ref_vol_name)
+            if volume_info:
+                return volume_info
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 400 and
+                        ERR_MSG_NOT_EXIST in err.text):
+                    ctxt.reraise = False
+
+        # If volume information was unable to be retrieved we need
+        # to throw a Invalid Reference exception
+        raise exception.ManageExistingInvalidReference(
+            existing_ref=existing_ref,
+            reason=_("Unable to find volume with name=%s") % ref_vol_name)
+
+    def manage_existing(self, volume, existing_ref):
+        """Brings an existing backend storage object under Cinder management.
+
+        We expect a volume name in the existing_ref that matches one in Purity.
+        """
+        LOG.debug("Enter PureISCSIDriver.manage_existing.")
+
+        self._validate_manage_existing_ref(existing_ref)
+
+        ref_vol_name = existing_ref['name']
+
+        connected_hosts = \
+            self._array.list_volume_private_connections(ref_vol_name)
+        if len(connected_hosts) > 0:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("PureISCSIDriver manage_existing cannot manage a "
+                         "volume connected to hosts. Please disconnect the "
+                         "volume from existing hosts before importing."))
+
+        new_vol_name = _get_vol_name(volume)
+        LOG.info(_LI("Renaming existing volume %(ref_name)s to %(new_name)s"),
+                 {"ref_name": ref_vol_name, "new_name": new_vol_name})
+        self._array.rename_volume(ref_vol_name, new_vol_name)
+        LOG.debug("Leave PureISCSIDriver.manage_existing.")
+        return None
+
+    def manage_existing_get_size(self, volume, existing_ref):
+        """Return size of volume to be managed by manage_existing.
+
+        We expect a volume name in the existing_ref that matches one in Purity.
+        """
+        LOG.debug("Enter PureISCSIDriver.manage_existing_get_size.")
+
+        volume_info = self._validate_manage_existing_ref(existing_ref)
+        size = math.ceil(float(volume_info["size"]) / units.Gi)
+
+        LOG.debug("Leave PureISCSIDriver.manage_existing_get_size.")
+        return size
+
+    def unmanage(self, volume):
+        """Removes the specified volume from Cinder management.
+
+        Does not delete the underlying backend storage object.
+
+        The volume will be renamed with "-unmanaged" as a suffix
+        """
+        vol_name = _get_vol_name(volume)
+        unmanaged_vol_name = vol_name + "-unmanaged"
+        LOG.info(_LI("Renaming existing volume %(ref_name)s to %(new_name)s"),
+                 {"ref_name": vol_name, "new_name": unmanaged_vol_name})
+        try:
+            self._array.rename_volume(vol_name, unmanaged_vol_name)
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 400 and
+                        ERR_MSG_NOT_EXIST in err.text):
+                    ctxt.reraise = False
+                    LOG.warn(_LW("Volume unmanage was unable to rename "
+                                 "the volume, error message: %s"), err.text)

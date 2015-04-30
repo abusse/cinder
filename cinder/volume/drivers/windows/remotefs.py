@@ -19,10 +19,12 @@ import sys
 if sys.platform == 'win32':
     import wmi
 
+from oslo_log import log as logging
+import six
+
 from cinder.brick.remotefs import remotefs
 from cinder import exception
-from cinder.openstack.common.gettextutils import _
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LE, _LI
 
 LOG = logging.getLogger(__name__)
 
@@ -58,7 +60,8 @@ class WindowsRemoteFsClient(remotefs.RemoteFsClient):
         if sys.version_info >= (3, 2):
             return os.path.islink(path)
 
-        file_attr = ctypes.windll.kernel32.GetFileAttributesW(unicode(path))
+        file_attr = ctypes.windll.kernel32.GetFileAttributesW(
+            six.text_type(path))
 
         return bool(os.path.isdir(path) and (
             file_attr & self._FILE_ATTRIBUTE_REPARSE_POINT))
@@ -112,7 +115,7 @@ class WindowsRemoteFsClient(remotefs.RemoteFsClient):
                                 options.get('pass'))
 
         try:
-            LOG.info(_('Mounting share: %s') % smbfs_share)
+            LOG.info(_LI('Mounting share: %s') % smbfs_share)
             self.smb_conn.Msft_SmbMapping.Create(**smb_opts)
         except wmi.x_wmi as exc:
             err_msg = (_(
@@ -134,7 +137,7 @@ class WindowsRemoteFsClient(remotefs.RemoteFsClient):
                                                ctypes.pointer(total_bytes),
                                                ctypes.pointer(free_bytes))
         if retcode == 0:
-            LOG.error(_("Could not get share %s capacity info.") %
+            LOG.error(_LE("Could not get share %s capacity info.") %
                       smbfs_share)
             return 0, 0
         return total_bytes.value, free_bytes.value

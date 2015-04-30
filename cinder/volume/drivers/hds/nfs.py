@@ -21,20 +21,22 @@ import os
 import time
 from xml.etree import ElementTree as ETree
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import units
 
 from cinder import exception
-from cinder.i18n import _
+from cinder.i18n import _, _LE, _LI
 from cinder.image import image_utils
-from cinder.openstack.common import excutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder.openstack.common import units
-from cinder.volume.drivers.hds.hnas_backend import HnasBackend
+from cinder.volume.drivers.hds import hnas_backend
 from cinder.volume.drivers import nfs
+from cinder.volume import utils
+from cinder.volume import volume_types
 
 
-HDS_HNAS_NFS_VERSION = '1.0.0'
+HDS_HNAS_NFS_VERSION = '3.0.0'
 
 LOG = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ NFS_OPTS = [
 CONF = cfg.CONF
 CONF.register_opts(NFS_OPTS)
 
-HNAS_DEFAULT_CONFIG = {'hnas_cmd': 'ssc'}
+HNAS_DEFAULT_CONFIG = {'hnas_cmd': 'ssc', 'ssh_port': '22'}
 
 
 def _xml_read(root, element, check=None):
@@ -59,9 +61,7 @@ def _xml_read(root, element, check=None):
 
     try:
         val = root.findtext(element)
-        LOG.info(_("%(element)s: %(val)s")
-                 % {'element': element,
-                    'val': val})
+        LOG.info(_LI("%(element)s: %(val)s"), {'element': element, 'val': val})
         if val:
             return val.strip()
         if check:
@@ -70,9 +70,9 @@ def _xml_read(root, element, check=None):
     except ETree.ParseError:
         if check:
             with excutils.save_and_reraise_exception():
-                LOG.error(_("XML exception reading parameter: %s") % element)
+                LOG.error(_LE("XML exception reading parameter: %s"), element)
         else:
-            LOG.info(_("XML exception reading parameter: %s") % element)
+            LOG.info(_LI("XML exception reading parameter: %s"), element)
             return None
 
 
@@ -82,21 +82,39 @@ def _read_config(xml_config_file):
     :param xml_config_file: string filename containing XML configuration
     """
 
+    if not os.access(xml_config_file, os.R_OK):
+        msg = (_("Can't open config file: %s") % xml_config_file)
+        raise exception.NotFound(message=msg)
+
     try:
         root = ETree.parse(xml_config_file).getroot()
     except Exception:
-        raise exception.NotFound(message='config file not found: '
-                                 + xml_config_file)
+        msg = (_("Error parsing config file: %s") % xml_config_file)
+        raise exception.ConfigNotFound(message=msg)
 
     # mandatory parameters
     config = {}
-    arg_prereqs = ['mgmt_ip0', 'username', 'password']
+    arg_prereqs = ['mgmt_ip0', 'username']
     for req in arg_prereqs:
         config[req] = _xml_read(root, req, 'check')
 
     # optional parameters
-    config['hnas_cmd'] = _xml_read(root, 'hnas_cmd') or\
-        HNAS_DEFAULT_CONFIG['hnas_cmd']
+    opt_parameters = ['hnas_cmd', 'ssh_enabled', 'cluster_admin_ip0']
+    for req in opt_parameters:
+        config[req] = _xml_read(root, req)
+
+    if config['ssh_enabled'] == 'True':
+        config['ssh_private_key'] = _xml_read(root, 'ssh_private_key', 'check')
+        config['password'] = _xml_read(root, 'password')
+        config['ssh_port'] = _xml_read(root, 'ssh_port')
+        if config['ssh_port'] is None:
+            config['ssh_port'] = HNAS_DEFAULT_CONFIG['ssh_port']
+    else:
+        # password is mandatory when not using SSH
+        config['password'] = _xml_read(root, 'password', 'check')
+
+    if config['hnas_cmd'] is None:
+        config['hnas_cmd'] = HNAS_DEFAULT_CONFIG['hnas_cmd']
 
     config['hdp'] = {}
     config['services'] = {}
@@ -120,15 +138,19 @@ def _read_config(xml_config_file):
     return config
 
 
-def factory_bend():
+def factory_bend(drv_config):
     """Factory over-ride in self-tests."""
 
-    return HnasBackend()
+    return hnas_backend.HnasBackend(drv_config)
 
 
 class HDSNFSDriver(nfs.NfsDriver):
     """Base class for Hitachi NFS driver.
-      Executes commands relating to Volumes.
+    Executes commands relating to Volumes.
+
+    Version 1.0.0: Initial driver version
+    Version 2.2.0:  Added support to SSH authentication
+
     """
 
     def __init__(self, *args, **kwargs):
@@ -143,8 +165,7 @@ class HDSNFSDriver(nfs.NfsDriver):
                 self.configuration.hds_hnas_nfs_config_file)
 
         super(HDSNFSDriver, self).__init__(*args, **kwargs)
-        self.bend = factory_bend()
-        (self.arid, self.nfs_name, self.lumax) = self._array_info_get()
+        self.bend = factory_bend(self.config)
 
     def _array_info_get(self):
         """Get array parameters."""
@@ -175,21 +196,19 @@ class HDSNFSDriver(nfs.NfsDriver):
         :param volume: dictionary volume reference
         """
 
-        label = None
-        if volume['volume_type']:
-            label = volume['volume_type']['name']
-        label = label or 'default'
-        if label not in self.config['services'].keys():
-            # default works if no match is found
-            label = 'default'
+        LOG.debug("_get_service: volume: %s", volume)
+        label = utils.extract_host(volume['host'], level='pool')
+
         if label in self.config['services'].keys():
             svc = self.config['services'][label]
-            LOG.info("Get service: %s->%s" % (label, svc['fslabel']))
+            LOG.info(_LI("Get service: %(lbl)s->%(svc)s"),
+                     {'lbl': label, 'svc': svc['fslabel']})
             service = (svc['hdp'], svc['path'], svc['fslabel'])
         else:
-            LOG.info(_("Available services: %s")
-                     % self.config['services'].keys())
-            LOG.error(_("No configuration found for service: %s") % label)
+            LOG.info(_LI("Available services: %s"),
+                     self.config['services'].keys())
+            LOG.error(_LE("No configuration found for service: %s"),
+                      label)
             raise exception.ParameterNotFound(param=label)
 
         return service
@@ -208,20 +227,20 @@ class HDSNFSDriver(nfs.NfsDriver):
         path = self._get_volume_path(nfs_mount, volume['name'])
 
         # Resize the image file on share to new size.
-        LOG.debug('Checking file for resize')
+        LOG.debug("Checking file for resize")
 
         if self._is_file_size_equal(path, new_size):
             return
         else:
-            LOG.info(_('Resizing file to %sG'), new_size)
+            LOG.info(_LI("Resizing file to %sG"), new_size)
             image_utils.resize_image(path, new_size)
             if self._is_file_size_equal(path, new_size):
-                LOG.info(_("LUN %(id)s extended to %(size)s GB.")
-                         % {'id': volume['id'], 'size': new_size})
+                LOG.info(_LI("LUN %(id)s extended to %(size)s GB."),
+                         {'id': volume['id'], 'size': new_size})
                 return
             else:
                 raise exception.InvalidResults(
-                    _('Resizing image file failed.'))
+                    _("Resizing image file failed."))
 
     def _is_file_size_equal(self, path, size):
         """Checks if file size at path is equal to size."""
@@ -237,13 +256,13 @@ class HDSNFSDriver(nfs.NfsDriver):
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
 
-        LOG.debug('create_volume_from %s', volume)
+        LOG.debug("create_volume_from %s", volume)
         vol_size = volume['size']
         snap_size = snapshot['volume_size']
 
         if vol_size != snap_size:
-            msg = _('Cannot create volume of size %(vol_size)s from '
-                    'snapshot of size %(snap_size)s')
+            msg = _("Cannot create volume of size %(vol_size)s from "
+                    "snapshot of size %(snap_size)s")
             msg_fmt = {'vol_size': vol_size, 'snap_size': snap_size}
             raise exception.CinderException(msg % msg_fmt)
 
@@ -349,8 +368,8 @@ class HDSNFSDriver(nfs.NfsDriver):
                 tries += 1
                 if tries >= self.configuration.num_shell_tries:
                     raise
-                LOG.exception(_("Recovering from a failed execute.  "
-                                "Try number %s"), tries)
+                LOG.exception(_LE("Recovering from a failed execute.  "
+                                  "Try number %s"), tries)
                 time.sleep(tries ** 2)
 
     def _get_volume_path(self, nfs_share, volume_name):
@@ -376,8 +395,8 @@ class HDSNFSDriver(nfs.NfsDriver):
         src_vol_size = src_vref['size']
 
         if vol_size != src_vol_size:
-            msg = _('Cannot create clone of size %(vol_size)s from '
-                    'volume of size %(src_vol_size)s')
+            msg = _("Cannot create clone of size %(vol_size)s from "
+                    "volume of size %(src_vol_size)s")
             msg_fmt = {'vol_size': vol_size, 'src_vol_size': src_vol_size}
             raise exception.CinderException(msg % msg_fmt)
 
@@ -393,11 +412,21 @@ class HDSNFSDriver(nfs.NfsDriver):
         """
 
         _stats = super(HDSNFSDriver, self).get_volume_stats(refresh)
-        be_name = self.configuration.safe_get('volume_backend_name')
-        _stats["volume_backend_name"] = be_name or 'HDSNFSDriver'
         _stats["vendor_name"] = 'HDS'
         _stats["driver_version"] = HDS_HNAS_NFS_VERSION
         _stats["storage_protocol"] = 'NFS'
+
+        for pool in self.pools:
+            capacity, free, used = self._get_capacity_info(pool['hdp'])
+            pool['total_capacity_gb'] = capacity / float(units.Gi)
+            pool['free_capacity_gb'] = free / float(units.Gi)
+            pool['allocated_capacity_gb'] = used / float(units.Gi)
+            pool['QoS_support'] = 'False'
+            pool['reserved_percentage'] = 0
+
+        _stats['pools'] = self.pools
+
+        LOG.info(_LI('Driver stats: %s'), _stats)
 
         return _stats
 
@@ -421,13 +450,10 @@ class HDSNFSDriver(nfs.NfsDriver):
                 conf[key]['path'] = path
                 conf[key]['hdp'] = hdp
                 conf[key]['fslabel'] = fslabel
-                msg = _('nfs_info: %(key)s: %(path)s, HDP: \
-                        %(fslabel)s FSID: %(hdp)s')
-                LOG.info(msg
-                         % {'key': key,
-                            'path': path,
-                            'fslabel': fslabel,
-                            'hdp': hdp})
+                msg = _("nfs_info: %(key)s: %(path)s, HDP: \
+                        %(fslabel)s FSID: %(hdp)s")
+                LOG.info(msg, {'key': key, 'path': path, 'fslabel': fslabel,
+                               'hdp': hdp})
 
         return conf
 
@@ -438,14 +464,16 @@ class HDSNFSDriver(nfs.NfsDriver):
         self._load_shares_config(getattr(self.configuration,
                                          self.driver_prefix +
                                          '_shares_config'))
-        LOG.info("Review shares: %s" % self.shares)
+        LOG.info(_LI("Review shares: %s"), self.shares)
 
         nfs_info = self._get_nfs_info()
 
+        LOG.debug("nfs_info: %s", nfs_info)
+
         for share in self.shares:
-            #export = share.split(':')[1]
             if share in nfs_info.keys():
-                LOG.info("share: %s -> %s" % (share, nfs_info[share]['path']))
+                LOG.info(_LI("share: %(share)s -> %(info)s"),
+                         {'share': share, 'info': nfs_info[share]['path']})
 
                 for svc in self.config['services'].keys():
                     if share == self.config['services'][svc]['hdp']:
@@ -456,17 +484,33 @@ class HDSNFSDriver(nfs.NfsDriver):
                             nfs_info[share]['hdp']
                         self.config['services'][svc]['fslabel'] = \
                             nfs_info[share]['fslabel']
-                        LOG.info("Save service info for %s -> %s, %s"
-                                 % (svc, nfs_info[share]['hdp'],
-                                    nfs_info[share]['path']))
+                        LOG.info(_LI("Save service info for"
+                                     " %(svc)s -> %(hdp)s, %(path)s"),
+                                 {'svc': svc, 'hdp': nfs_info[share]['hdp'],
+                                  'path': nfs_info[share]['path']})
                         break
                 if share != self.config['services'][svc]['hdp']:
-                    LOG.error("NFS share %s has no service entry: %s -> %s"
-                              % (share, svc,
-                                 self.config['services'][svc]['hdp']))
+                    LOG.error(_LE("NFS share %(share)s has no service entry:"
+                                  " %(svc)s -> %(hdp)s"),
+                              {'share': share, 'svc': svc,
+                               'hdp': self.config['services'][svc]['hdp']})
                     raise exception.ParameterNotFound(param=svc)
             else:
-                LOG.info("share: %s incorrect entry" % share)
+                LOG.info(_LI("share: %s incorrect entry"), share)
+
+        LOG.debug("self.config['services'] = %s", self.config['services'])
+
+        service_list = self.config['services'].keys()
+        for svc in service_list:
+            svc = self.config['services'][svc]
+            pool = {}
+            pool['pool_name'] = svc['volume_type']
+            pool['service_label'] = svc['volume_type']
+            pool['hdp'] = svc['hdp']
+
+            self.pools.append(pool)
+
+        LOG.info(_LI("Configured pools: %s"), self.pools)
 
     def _clone_volume(self, volume_name, clone_name, volume_id):
         """Clones mounted volume using the HNAS file_clone.
@@ -478,8 +522,10 @@ class HDSNFSDriver(nfs.NfsDriver):
 
         export_path = self._get_export_path(volume_id)
         # volume-ID snapshot-ID, /cinder
-        LOG.info("Cloning with volume_name %s clone_name %s export_path %s"
-                 % (volume_name, clone_name, export_path))
+        LOG.info(_LI("Cloning with volume_name %(vname)s clone_name %(cname)s"
+                     " export_path %(epath)s"), {'vname': volume_name,
+                                                 'cname': clone_name,
+                                                 'epath': export_path})
 
         source_vol = self._id_to_vol(volume_id)
         # sps; added target
@@ -493,3 +539,38 @@ class HDSNFSDriver(nfs.NfsDriver):
                                    _fslabel, source_path, target_path)
 
         return out
+
+    def get_pool(self, volume):
+        if not volume['volume_type']:
+            return 'default'
+        else:
+            metadata = {}
+            type_id = volume['volume_type_id']
+            if type_id is not None:
+                metadata = volume_types.get_volume_type_extra_specs(type_id)
+            if not metadata.get('service_label'):
+                return 'default'
+            else:
+                if metadata['service_label'] not in \
+                        self.config['services'].keys():
+                    return 'default'
+                else:
+                    return metadata['service_label']
+
+    def create_volume(self, volume):
+        """Creates a volume.
+
+        :param volume: volume reference
+        """
+        self._ensure_shares_mounted()
+
+        (_hdp, _path, _fslabel) = self._get_service(volume)
+
+        volume['provider_location'] = _hdp
+
+        LOG.info(_LI("Volume service: %(label)s. Casted to: %(loc)s"),
+                 {'label': _fslabel, 'loc': volume['provider_location']})
+
+        self._do_create_volume(volume)
+
+        return {'provider_location': volume['provider_location']}

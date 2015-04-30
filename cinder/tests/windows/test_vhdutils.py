@@ -48,9 +48,10 @@ class VHDUtilsTestCase(test.TestCase):
         fake_ctypes.c_ulong = lambda x: x
 
         mock.patch.multiple(
-            'cinder.volume.drivers.windows.vhdutils', ctypes=fake_ctypes,
-            windll=mock.DEFAULT, wintypes=mock.DEFAULT, kernel32=mock.DEFAULT,
-            virtdisk=mock.DEFAULT, Win32_GUID=mock.DEFAULT,
+            'cinder.volume.drivers.windows.vhdutils',
+            ctypes=fake_ctypes, kernel32=mock.DEFAULT,
+            wintypes=mock.DEFAULT, virtdisk=mock.DEFAULT,
+            Win32_GUID=mock.DEFAULT,
             Win32_RESIZE_VIRTUAL_DISK_PARAMETERS=mock.DEFAULT,
             Win32_CREATE_VIRTUAL_DISK_PARAMETERS=mock.DEFAULT,
             Win32_VIRTUAL_STORAGE_TYPE=mock.DEFAULT,
@@ -302,7 +303,7 @@ class VHDUtilsTestCase(test.TestCase):
             open_access_mask=vhdutils.VIRTUAL_DISK_ACCESS_GET_INFO)
         self._vhdutils._get_vhd_info_member.assert_called_with(
             self._FAKE_FILE_HANDLE, fake_info_member)
-        self._vhdutils._close.assert_called_once()
+        self._vhdutils._close.assert_called_once_with(self._FAKE_FILE_HANDLE)
 
     def test_parse_vhd_info(self):
         fake_physical_size = self._FAKE_VHD_SIZE + 1

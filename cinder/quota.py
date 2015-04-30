@@ -19,15 +19,16 @@
 
 import datetime
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import timeutils
 
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import importutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.i18n import _, _LE
+from cinder.openstack.common import versionutils
 
 
 LOG = logging.getLogger(__name__)
@@ -115,11 +116,12 @@ class DbQuotaDriver(object):
 
         for resource in resources.values():
             if resource.name not in default_quotas:
-                LOG.deprecated(_("Default quota for resource: %(res)s is set "
-                                 "by the default quota flag: quota_%(res)s, "
-                                 "it is now deprecated. Please use the "
-                                 "default quota class for default "
-                                 "quota.") % {'res': resource.name})
+                versionutils.report_deprecated_feature(LOG, _(
+                    "Default quota for resource: %(res)s is set "
+                    "by the default quota flag: quota_%(res)s, "
+                    "it is now deprecated. Please use the "
+                    "default quota class for default "
+                    "quota.") % {'res': resource.name})
             quotas[resource.name] = default_quotas.get(resource.name,
                                                        resource.default)
 
@@ -758,7 +760,7 @@ class QuotaEngine(object):
                                             expire=expire,
                                             project_id=project_id)
 
-        LOG.debug("Created reservations %s" % reservations)
+        LOG.debug("Created reservations %s", reservations)
 
         return reservations
 
@@ -780,7 +782,8 @@ class QuotaEngine(object):
             # usage resynchronization and the reservation expiration
             # mechanisms will resolve the issue.  The exception is
             # logged, however, because this is less than optimal.
-            LOG.exception(_("Failed to commit reservations %s") % reservations)
+            LOG.exception(_LE("Failed to commit "
+                              "reservations %s"), reservations)
 
     def rollback(self, context, reservations, project_id=None):
         """Roll back reservations.
@@ -800,8 +803,8 @@ class QuotaEngine(object):
             # usage resynchronization and the reservation expiration
             # mechanisms will resolve the issue.  The exception is
             # logged, however, because this is less than optimal.
-            LOG.exception(_("Failed to roll back reservations "
-                            "%s") % reservations)
+            LOG.exception(_LE("Failed to roll back reservations "
+                              "%s"), reservations)
 
     def destroy_all_by_project(self, context, project_id):
         """Destroy all quotas, usages, and reservations associated with a

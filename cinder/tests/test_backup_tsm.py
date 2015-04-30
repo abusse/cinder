@@ -17,17 +17,18 @@
 Tests for volume backup to IBM Tivoli Storage Manager (TSM).
 """
 
-import datetime
 import json
 import os
 import posix
+
+from oslo_concurrency import processutils as putils
+from oslo_log import log as logging
+from oslo_utils import timeutils
 
 from cinder.backup.drivers import tsm
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils as putils
 from cinder import test
 from cinder import utils
 
@@ -36,7 +37,7 @@ SIM = None
 VOLUME_PATH = '/dev/null'
 
 
-class TSMBackupSimulator:
+class TSMBackupSimulator(object):
     """Simulates TSM dsmc command.
 
     The simulator simulates the execution of the 'dsmc' command.
@@ -74,7 +75,7 @@ class TSMBackupSimulator:
                 self._backup_list[path] = []
             else:
                 self._backup_list[path][-1]['active'] = False
-            date = datetime.datetime.now()
+            date = timeutils.utcnow()
             datestr = date.strftime("%m/%d/%Y %H:%M:%S")
             self._backup_list[path].append({'date': datestr, 'active': True})
             retcode = 0

@@ -19,13 +19,14 @@
 Hitachi Unified Storage (HUS) platform. Backend operations.
 """
 
-from cinder.openstack.common import log as logging
+from oslo_log import log as logging
+
 from cinder import utils
 
 LOG = logging.getLogger("cinder.volume.driver")
 
 
-class HusBackend:
+class HusBackend(object):
     """Back end. Talks to HUS."""
     def get_version(self, cmd, ver, ip0, ip1, user, pw):
         out, err = utils.execute(cmd,

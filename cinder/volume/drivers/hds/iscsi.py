@@ -17,22 +17,23 @@
 """
 iSCSI Cinder Volume driver for Hitachi Unified Storage (HUS-HNAS) platform.
 """
-
+import os
 from xml.etree import ElementTree as ETree
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import units
 
 from cinder import exception
-from cinder.i18n import _
-from cinder.openstack.common import excutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import units
+from cinder.i18n import _, _LE, _LI, _LW
 from cinder.volume import driver
-from cinder.volume.drivers.hds.hnas_backend import HnasBackend
+from cinder.volume.drivers.hds import hnas_backend
 from cinder.volume import utils
+from cinder.volume import volume_types
 
 
-HDS_HNAS_ISCSI_VERSION = '1.0.0'
+HDS_HNAS_ISCSI_VERSION = '3.0.0'
 
 LOG = logging.getLogger(__name__)
 
@@ -44,17 +45,19 @@ iSCSI_OPTS = [
 CONF = cfg.CONF
 CONF.register_opts(iSCSI_OPTS)
 
-HNAS_DEFAULT_CONFIG = {'hnas_cmd': 'ssc', 'chap_enabled': 'True'}
+HNAS_DEFAULT_CONFIG = {'hnas_cmd': 'ssc',
+                       'chap_enabled': 'True',
+                       'ssh_port': '22'}
 
 
-def factory_bend(type):
-    return HnasBackend()
+def factory_bend(drv_configs):
+    return hnas_backend.HnasBackend(drv_configs)
 
 
 def _loc_info(loc):
     """Parse info from location string."""
 
-    LOG.info("Parse_loc: %s" % loc)
+    LOG.info(_LI("Parse_loc: %s"), loc)
     info = {}
     tup = loc.split(',')
     if len(tup) < 5:
@@ -70,9 +73,7 @@ def _xml_read(root, element, check=None):
 
     try:
         val = root.findtext(element)
-        LOG.info(_("%(element)s: %(val)s")
-                 % {'element': element,
-                    'val': val})
+        LOG.info(_LI("%(element)s: %(val)s"), {'element': element, 'val': val})
         if val:
             return val.strip()
         if check:
@@ -81,31 +82,52 @@ def _xml_read(root, element, check=None):
     except ETree.ParseError:
         if check:
             with excutils.save_and_reraise_exception():
-                LOG.error(_("XML exception reading parameter: %s") % element)
+                LOG.error(_LE("XML exception reading parameter: %s"), element)
         else:
-            LOG.info(_("XML exception reading parameter: %s") % element)
+            LOG.info(_LI("XML exception reading parameter: %s"), element)
             return None
 
 
 def _read_config(xml_config_file):
     """Read hds driver specific xml config file."""
 
+    if not os.access(xml_config_file, os.R_OK):
+        msg = (_("Can't open config file: %s") % xml_config_file)
+        raise exception.NotFound(message=msg)
+
     try:
         root = ETree.parse(xml_config_file).getroot()
     except Exception:
-        raise exception.NotFound(message='config file not found: '
-                                 + xml_config_file)
+        msg = (_("Error parsing config file: %s") % xml_config_file)
+        raise exception.ConfigNotFound(message=msg)
 
     # mandatory parameters
     config = {}
-    arg_prereqs = ['mgmt_ip0', 'username', 'password']
+    arg_prereqs = ['mgmt_ip0', 'username']
     for req in arg_prereqs:
         config[req] = _xml_read(root, req, 'check')
 
     # optional parameters
-    for opt in ['hnas_cmd', 'chap_enabled']:
-        config[opt] = _xml_read(root, opt) or\
-            HNAS_DEFAULT_CONFIG[opt]
+    opt_parameters = ['hnas_cmd', 'ssh_enabled', 'chap_enabled',
+                      'cluster_admin_ip0']
+    for req in opt_parameters:
+        config[req] = _xml_read(root, req)
+
+    if config['chap_enabled'] is None:
+        config['chap_enabled'] = HNAS_DEFAULT_CONFIG['chap_enabled']
+
+    if config['ssh_enabled'] == 'True':
+        config['ssh_private_key'] = _xml_read(root, 'ssh_private_key', 'check')
+        config['ssh_port'] = _xml_read(root, 'ssh_port')
+        config['password'] = _xml_read(root, 'password')
+        if config['ssh_port'] is None:
+            config['ssh_port'] = HNAS_DEFAULT_CONFIG['ssh_port']
+    else:
+        # password is mandatory when not using SSH
+        config['password'] = _xml_read(root, 'password', 'check')
+
+    if config['hnas_cmd'] is None:
+        config['hnas_cmd'] = HNAS_DEFAULT_CONFIG['hnas_cmd']
 
     config['hdp'] = {}
     config['services'] = {}
@@ -130,7 +152,11 @@ def _read_config(xml_config_file):
 
 
 class HDSISCSIDriver(driver.ISCSIDriver):
-    """HDS HNAS volume driver."""
+    """HDS HNAS volume driver.
+
+    Version 1.0.0: Initial driver version
+    Version 2.2.0:  Added support to SSH authentication
+    """
 
     def __init__(self, *args, **kwargs):
         """Initialize, read different config parameters."""
@@ -144,8 +170,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         self.type = 'HNAS'
 
         self.platform = self.type.lower()
-        LOG.info(_("Backend type: %s") % self.type)
-        self.bend = factory_bend(self.type)
+        LOG.info(_LI("Backend type: %s"), self.type)
+        self.bend = factory_bend(self.config)
 
     def _array_info_get(self):
         """Get array parameters."""
@@ -179,12 +205,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                 conf[ip]['ctl'] = ctl
                 conf[ip]['port'] = port
                 conf[ip]['iscsi_port'] = ipp
-                msg = ('portal: %(ip)s:%(ipp)s, CTL: %(ctl)s, port: %(port)s')
-                LOG.debug(msg
-                          % {'ip': ip,
-                             'ipp': ipp,
-                             'ctl': ctl,
-                             'port': port})
+                msg = "portal: %(ip)s:%(ipp)s, CTL: %(ctl)s, port: %(pt)s"
+                LOG.debug(msg, {'ip': ip, 'ipp': ipp, 'ctl': ctl, 'pt': port})
 
         return conf
 
@@ -194,17 +216,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
            :param volume: dictionary volume reference
         """
 
-        label = None
-        if volume['volume_type']:
-            label = volume['volume_type']['name']
-
-        label = label or 'default'
-        if label not in self.config['services'].keys():
-            # default works if no match is found
-            label = 'default'
-            LOG.info(_("Using default: instead of %s") % label)
-            LOG.info(_("Available services: %s")
-                     % self.config['services'].keys())
+        label = utils.extract_host(volume['host'], level='pool')
+        LOG.info(_LI("Using service label: %s"), label)
 
         if label in self.config['services'].keys():
             svc = self.config['services'][label]
@@ -215,8 +228,7 @@ class HDSISCSIDriver(driver.ISCSIDriver):
             if self.config['chap_enabled'] == 'True':
                 # it may not exist, create and set secret
                 if 'iscsi_secret' not in svc:
-                    LOG.info(_("Retrieving secret for service: %s")
-                             % label)
+                    LOG.info(_LI("Retrieving secret for service: %s"), label)
 
                     out = self.bend.get_targetsecret(self.config['hnas_cmd'],
                                                      self.config['mgmt_ip0'],
@@ -231,12 +243,12 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                                                    self.config['mgmt_ip0'],
                                                    self.config['username'],
                                                    self.config['password'],
-                                                   svc['iscsi_target'],
+                                                   'cinder-' + label,
                                                    svc['hdp'],
                                                    svc['iscsi_secret'])
 
-                        LOG.info("Set tgt CHAP secret for service: %s"
-                                 % (label))
+                        LOG.info(_LI("Set tgt CHAP secret for service: %s"),
+                                 label)
             else:
                 # We set blank password when the client does not
                 # support CHAP. Later on, if the client tries to create a new
@@ -244,12 +256,12 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                 # value and use a temporary dummy password.
                 if 'iscsi_secret' not in svc:
                     # Warns in the first time
-                    LOG.info("CHAP authentication disabled")
+                    LOG.info(_LE("CHAP authentication disabled"))
 
                 svc['iscsi_secret'] = ""
 
             if 'iscsi_target' not in svc:
-                LOG.info(_("Retrieving target for service: %s") % label)
+                LOG.info(_LI("Retrieving target for service: %s"), label)
 
                 out = self.bend.get_targetiqn(self.config['hnas_cmd'],
                                               self.config['mgmt_ip0'],
@@ -266,10 +278,9 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                        svc['port'], svc['hdp'], svc['iscsi_target'],
                        svc['iscsi_secret'])
         else:
-            LOG.info(_("Available services: %s")
-                     % self.config['services'].keys())
-            LOG.error(_("No configuration found for service: %s")
-                      % label)
+            LOG.info(_LI("Available services: %s"),
+                     self.config['services'].keys())
+            LOG.error(_LE("No configuration found for service: %s"), label)
             raise exception.ParameterNotFound(param=label)
 
         return service
@@ -277,38 +288,33 @@ class HDSISCSIDriver(driver.ISCSIDriver):
     def _get_stats(self):
         """Get HDP stats from HNAS."""
 
-        total_cap = 0
-        total_used = 0
-        out = self.bend.get_hdp_info(self.config['hnas_cmd'],
-                                     self.config['mgmt_ip0'],
-                                     self.config['username'],
-                                     self.config['password'])
-
-        for line in out.split('\n'):
-            if 'HDP' in line:
-                (hdp, size, _ign, used) = line.split()[1:5]  # in MB
-                LOG.debug("stats: looking for: %s", hdp)
-                if int(hdp) >= units.Ki:        # HNAS fsid
-                    hdp = line.split()[11]
-                if hdp in self.config['hdp'].keys():
-                    total_cap += int(size)
-                    total_used += int(used)
-
-        LOG.info("stats: total: %d used: %d" % (total_cap, total_used))
-
         hnas_stat = {}
-        hnas_stat['total_capacity_gb'] = int(total_cap / units.Ki)  # in GB
-        hnas_stat['free_capacity_gb'] = \
-            int((total_cap - total_used) / units.Ki)
         be_name = self.configuration.safe_get('volume_backend_name')
         hnas_stat["volume_backend_name"] = be_name or 'HDSISCSIDriver'
         hnas_stat["vendor_name"] = 'HDS'
         hnas_stat["driver_version"] = HDS_HNAS_ISCSI_VERSION
         hnas_stat["storage_protocol"] = 'iSCSI'
-        hnas_stat['QoS_support'] = False
         hnas_stat['reserved_percentage'] = 0
 
-        LOG.info(_("stats: stats: %s") % hnas_stat)
+        for pool in self.pools:
+            out = self.bend.get_hdp_info(self.config['hnas_cmd'],
+                                         self.config['mgmt_ip0'],
+                                         self.config['username'],
+                                         self.config['password'],
+                                         pool['hdp'])
+
+            LOG.debug('Query for pool %s: %s', pool['pool_name'], out)
+
+            (hdp, size, _ign, used) = out.split()[1:5]  # in MB
+            pool['total_capacity_gb'] = int(size) / units.Ki
+            pool['free_capacity_gb'] = (int(size) - int(used)) / units.Ki
+            pool['allocated_capacity_gb'] = int(used) / units.Ki
+            pool['QoS_support'] = 'False'
+            pool['reserved_percentage'] = 0
+
+        hnas_stat['pools'] = self.pools
+
+        LOG.info(_LI("stats: stats: %s"), hnas_stat)
         return hnas_stat
 
     def _get_hdp_list(self):
@@ -331,7 +337,7 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                     hdp_list.extend(inf[1:2])
 
         # returns a list of HDP IDs
-        LOG.info(_("HDP list: %s") % hdp_list)
+        LOG.info(_LI("HDP list: %s"), hdp_list)
         return hdp_list
 
     def _check_hdp_list(self):
@@ -346,7 +352,7 @@ class HDSISCSIDriver(driver.ISCSIDriver):
 
         for hdp in lst:
             if hdp not in hdpl:
-                LOG.error(_("HDP not found: %s") % hdp)
+                LOG.error(_LE("HDP not found: %s"), hdp)
                 err = "HDP not found: " + hdp
                 raise exception.ParameterNotFound(param=err)
             # status, verify corresponding status is Normal
@@ -381,19 +387,32 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         (self.arid, self.hnas_name, self.lumax) = self._array_info_get()
         self._check_hdp_list()
 
+        service_list = self.config['services'].keys()
+        for svc in service_list:
+            svc = self.config['services'][svc]
+            pool = {}
+            pool['pool_name'] = svc['volume_type']
+            pool['service_label'] = svc['volume_type']
+            pool['hdp'] = svc['hdp']
+
+            self.pools.append(pool)
+
+        LOG.info(_LI("Configured pools: %s"), self.pools)
+
         iscsi_info = self._get_iscsi_info()
-        LOG.info(_("do_setup: %s") % iscsi_info)
+        LOG.info(_LI("do_setup: %s"), iscsi_info)
         for svc in self.config['services'].keys():
             svc_ip = self.config['services'][svc]['iscsi_ip']
             if svc_ip in iscsi_info.keys():
-                LOG.info(_("iSCSI portal found for service: %s") % svc_ip)
+                LOG.info(_LI("iSCSI portal found for service: %s"), svc_ip)
                 self.config['services'][svc]['port'] = \
                     iscsi_info[svc_ip]['port']
                 self.config['services'][svc]['ctl'] = iscsi_info[svc_ip]['ctl']
                 self.config['services'][svc]['iscsi_port'] = \
                     iscsi_info[svc_ip]['iscsi_port']
             else:          # config iscsi address not found on device!
-                LOG.error(_("iSCSI portal not found for service: %s") % svc_ip)
+                LOG.error(_LE("iSCSI portal not found "
+                              "for service: %s"), svc_ip)
                 raise exception.ParameterNotFound(param=svc_ip)
 
     def ensure_export(self, context, volume):
@@ -406,21 +425,20 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         """
 
         name = volume['name']
-        LOG.debug("create_export %(name)s" % {'name': name})
+        LOG.debug("create_export %s", name)
 
         pass
 
     def remove_export(self, context, volume):
         """Disconnect a volume from an attached instance.
            :param context: context
-           :param volume: dictionary volume referencej
+           :param volume: dictionary volume reference
         """
 
         provider = volume['provider_location']
         name = volume['name']
-        LOG.debug("remove_export provider %(provider)s on %(name)s"
-                  % {'provider': provider,
-                     'name': name})
+        LOG.debug("remove_export provider %(provider)s on %(name)s",
+                  {'provider': provider, 'name': name})
 
         pass
 
@@ -439,14 +457,14 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                                   '%s' % (int(volume['size']) * units.Ki),
                                   volume['name'])
 
-        LOG.info(_("create_volume: create_lu returns %s") % out)
+        LOG.info(_LI("create_volume: create_lu returns %s"), out)
 
         lun = self.arid + '.' + out.split()[1]
         sz = int(out.split()[5])
 
         # Example: 92210013.volume-44d7e29b-2aa4-4606-8bc4-9601528149fd
-        LOG.info(_("LUN %(lun)s of size %(sz)s MB is created.")
-                 % {'lun': lun, 'sz': sz})
+        LOG.info(_LI("LUN %(lun)s of size %(sz)s MB is created."),
+                 {'lun': lun, 'sz': sz})
         return {'provider_location': lun}
 
     def create_cloned_volume(self, dst, src):
@@ -473,9 +491,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         lun = self.arid + '.' + out.split()[1]
         size = int(out.split()[5])
 
-        LOG.debug("LUN %(lun)s of size %(size)s MB is cloned."
-                  % {'lun': lun,
-                     'size': size})
+        LOG.debug("LUN %(lun)s of size %(size)s MB is cloned.",
+                  {'lun': lun, 'size': size})
         return {'provider_location': lun}
 
     def extend_volume(self, volume, new_size):
@@ -496,8 +513,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
                              '%s' % (new_size * units.Ki),
                              volume['name'])
 
-        LOG.info(_("LUN %(lun)s extended to %(size)s GB.")
-                 % {'lun': lun, 'size': new_size})
+        LOG.info(_LI("LUN %(lun)s extended to %(size)s GB."),
+                 {'lun': lun, 'size': new_size})
 
     def delete_volume(self, volume):
         """Delete an LU on HNAS.
@@ -506,12 +523,12 @@ class HDSISCSIDriver(driver.ISCSIDriver):
 
         prov_loc = volume['provider_location']
         if prov_loc is None:
-            LOG.error("delete_vol: provider location empty.")
+            LOG.error(_LE("delete_vol: provider location empty."))
             return
         info = _loc_info(prov_loc)
         (arid, lun) = info['id_lu']
         if 'tgt' in info.keys():  # connected?
-            LOG.info("delete lun loc %s" % info['tgt'])
+            LOG.info(_LI("delete lun loc %s"), info['tgt'])
             # loc = id.lun
             (_portal, iqn, loc, ctl, port, hlun) = info['tgt']
             self.bend.del_iscsi_conn(self.config['hnas_cmd'],
@@ -522,9 +539,7 @@ class HDSISCSIDriver(driver.ISCSIDriver):
 
         name = self.hnas_name
 
-        LOG.debug("delete lun %(lun)s on %(name)s"
-                  % {'lun': lun,
-                     'name': name})
+        LOG.debug("delete lun %(lun)s on %(name)s", {'lun': lun, 'name': name})
 
         service = self._get_service(volume)
         (_ip, _ipp, _ctl, _port, hdp, target, secret) = service
@@ -541,7 +556,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
            :param connector: dictionary connector reference
         """
 
-        LOG.info("initialize volume %s connector %s" % (volume, connector))
+        LOG.info(_LI("initialize volume %(vol)s connector %(conn)s"),
+                 {'vol': volume, 'conn': connector})
 
         # connector[ip, host, wwnns, unititator, wwp/
         service = self._get_service(volume)
@@ -569,7 +585,7 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         tgt = hnas_portal + ',' + iqn + ',' + loc + ',' + ctl + ','
         tgt += port + ',' + hlun
 
-        LOG.info("initiate: connection %s" % tgt)
+        LOG.info(_LI("initiate: connection %s"), tgt)
 
         properties = {}
         properties['provider_location'] = tgt
@@ -596,11 +612,11 @@ class HDSISCSIDriver(driver.ISCSIDriver):
 
         info = _loc_info(volume['provider_location'])
         if 'tgt' not in info.keys():  # spurious disconnection
-            LOG.warn("terminate_conn: provider location empty.")
+            LOG.warn(_LW("terminate_conn: provider location empty."))
             return
         (arid, lun) = info['id_lu']
         (_portal, iqn, loc, ctl, port, hlun) = info['tgt']
-        LOG.info("terminate: connection %s" % volume['provider_location'])
+        LOG.info(_LI("terminate: connection %s"), volume['provider_location'])
         self.bend.del_iscsi_conn(self.config['hnas_cmd'],
                                  self.config['mgmt_ip0'],
                                  self.config['username'],
@@ -630,8 +646,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         lun = self.arid + '.' + out.split()[1]
         sz = int(out.split()[5])
 
-        LOG.debug("LUN %(lun)s of size %(sz)s MB is created from snapshot."
-                  % {'lun': lun, 'sz': sz})
+        LOG.debug("LUN %(lun)s of size %(sz)s MB is created from snapshot.",
+                  {'lun': lun, 'sz': sz})
         return {'provider_location': lun}
 
     def create_snapshot(self, snapshot):
@@ -654,8 +670,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         lun = self.arid + '.' + out.split()[1]
         size = int(out.split()[5])
 
-        LOG.debug("LUN %(lun)s of size %(size)s MB is created."
-                  % {'lun': lun, 'size': size})
+        LOG.debug("LUN %(lun)s of size %(size)s MB is created.",
+                  {'lun': lun, 'size': size})
         return {'provider_location': lun}
 
     def delete_snapshot(self, snapshot):
@@ -678,9 +694,8 @@ class HDSISCSIDriver(driver.ISCSIDriver):
         myid = self.arid
 
         if arid != myid:
-            LOG.error(_('Array mismatch %(myid)s vs %(arid)s')
-                      % {'myid': myid,
-                         'arid': arid})
+            LOG.error(_LE("Array mismatch %(myid)s vs %(arid)s"),
+                      {'myid': myid, 'arid': arid})
             msg = 'Array id mismatch in delete snapshot'
             raise exception.VolumeBackendAPIException(data=msg)
         self.bend.delete_lu(self.config['hnas_cmd'],
@@ -699,3 +714,22 @@ class HDSISCSIDriver(driver.ISCSIDriver):
             self.driver_stats = self._get_stats()
 
         return self.driver_stats
+
+    def get_pool(self, volume):
+
+        if not volume['volume_type']:
+            return 'default'
+        else:
+            metadata = {}
+            type_id = volume['volume_type_id']
+            if type_id is not None:
+                metadata = volume_types.get_volume_type_extra_specs(type_id)
+            if not metadata.get('service_label'):
+                return 'default'
+            else:
+                if metadata['service_label'] not in \
+                        self.config['services'].keys():
+                    return 'default'
+                else:
+                    pass
+                return metadata['service_label']

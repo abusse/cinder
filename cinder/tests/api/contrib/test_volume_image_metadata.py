@@ -12,16 +12,15 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
-import datetime
 import json
 import uuid
 from xml.dom import minidom
 
+from oslo_utils import timeutils
 import webob
 
 from cinder.api import common
-from cinder.api.openstack.wsgi import MetadataXMLDeserializer
-from cinder.api.openstack.wsgi import XMLDeserializer
+from cinder.api.openstack import wsgi
 from cinder import db
 from cinder import test
 from cinder.tests.api import fakes
@@ -35,7 +34,7 @@ def fake_volume_get(*args, **kwargs):
         'status': 'available',
         'size': 5,
         'availability_zone': 'somewhere',
-        'created_at': datetime.datetime.now(),
+        'created_at': timeutils.utcnow(),
         'attach_status': None,
         'display_name': 'anothervolume',
         'display_description': 'Just another volume!',
@@ -115,15 +114,15 @@ class VolumeImageMetadataXMLTest(VolumeImageMetadataTest):
     content_type = 'application/xml'
 
     def _get_image_metadata(self, body):
-        deserializer = XMLDeserializer()
+        deserializer = wsgi.XMLDeserializer()
         volume = deserializer.find_first_child_named(
             minidom.parseString(body), 'volume')
         image_metadata = deserializer.find_first_child_named(
             volume, 'volume_image_metadata')
-        return MetadataXMLDeserializer().extract_metadata(image_metadata)
+        return wsgi.MetadataXMLDeserializer().extract_metadata(image_metadata)
 
     def _get_image_metadata_list(self, body):
-        deserializer = XMLDeserializer()
+        deserializer = wsgi.XMLDeserializer()
         volumes = deserializer.find_first_child_named(
             minidom.parseString(body), 'volumes')
         volume_list = deserializer.find_children_named(volumes, 'volume')
@@ -132,5 +131,5 @@ class VolumeImageMetadataXMLTest(VolumeImageMetadataTest):
                 volume, 'volume_image_metadata'
             )
             for volume in volume_list]
-        return map(MetadataXMLDeserializer().extract_metadata,
+        return map(wsgi.MetadataXMLDeserializer().extract_metadata,
                    image_metadata_list)
