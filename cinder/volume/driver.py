@@ -97,7 +97,7 @@ volume_opts = [
     cfg.StrOpt('iscsi_helper',
                default='tgtadm',
                choices=['tgtadm', 'lioadm', 'scstadmin', 'iseradm', 'iscsictl',
-                        'ietadm', 'fake'],
+                        'ietadm', 'ctladm', 'fake'],
                help='iSCSI target user-land tool to use. tgtadm is default, '
                     'use lioadm for LIO iSCSI support, scstadmin for SCST '
                     'target support, iseradm for the ISER protocol, ietadm '
@@ -110,6 +110,15 @@ volume_opts = [
     cfg.StrOpt('iet_conf',
                default='/etc/iet/ietd.conf',
                help='IET configuration file'),
+    cfg.StrOpt('ctl_deamon',
+               default='/etc/rc.d/ctld',
+               help='Path to the ctl deamon.'),
+    cfg.StrOpt('ctl_conf',
+               default='/etc/ctl.conf',
+               help='Path to the ctl global configuration file.'),
+    cfg.StrOpt('ctl_backend',
+               default='block',
+               help='Backend used in the ctl driver.'),
     cfg.StrOpt('chiscsi_conf',
                default='/etc/chelsio-iscsi/chiscsi.conf',
                help='Chiscsi (CXT) global defaults configuration file'),
@@ -294,7 +303,8 @@ class BaseVD(object):
             'lioadm': 'cinder.volume.targets.lio.LioAdm',
             'tgtadm': 'cinder.volume.targets.tgt.TgtAdm',
             'scstadmin': 'cinder.volume.targets.scst.SCSTAdm',
-            'iscsictl': 'cinder.volume.targets.cxt.CxtAdm'}
+            'iscsictl': 'cinder.volume.targets.cxt.CxtAdm',
+            'ctladm': 'cinder.volume.targets.ctl.CtlAdm'}
 
         # set True by manager after successful check_for_setup
         self._initialized = False

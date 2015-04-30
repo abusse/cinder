@@ -610,6 +610,7 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
         return model_update
 
     def _create_raw_volume(self, context, volume_ref, **kwargs):
+        LOG.info(_LI("Using driver: %s"), self.driver)
         return self.driver.create_volume(volume_ref)
 
     def execute(self, context, volume_ref, volume_spec):

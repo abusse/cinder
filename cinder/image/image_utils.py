@@ -94,11 +94,18 @@ def check_qemu_img_version(minimum_version):
         raise exception.VolumeBackendAPIException(data=_msg)
 
 
-def _convert_image(prefix, source, dest, out_format, run_as_root=True):
+def _convert_image(prefix, source, dest, out_format, run_as_root=True, sparse=0):
     """Convert image to other format."""
 
-    cmd = prefix + ('qemu-img', 'convert',
-                    '-O', out_format, source, dest)
+    cmd = prefix + ['qemu-img', 'convert',
+                    '-O', out_format]
+
+    if sparse:
+        # Sparse wil skip writing zeroes, so one should only use it
+        # on backing devices that are already zeroed.
+        cmd += ['-S', str(sparse)]
+
+    cmd += [source, dest]
 
     # Check whether O_DIRECT is supported and set '-t none' if it is
     # This is needed to ensure that all data hit the device before
@@ -113,9 +120,16 @@ def _convert_image(prefix, source, dest, out_format, run_as_root=True):
             volume_utils.check_for_odirect_support(source,
                                                    dest,
                                                    'oflag=direct')):
-        cmd = prefix + ('qemu-img', 'convert',
+        cmd = prefix + ['qemu-img', 'convert',
                         '-t', 'none',
-                        '-O', out_format, source, dest)
+                        '-O', out_format]
+
+        if sparse:
+            # Sparse wil skip writing zeroes, so one should only use it
+            # on backing devices that are already zeroed.
+            cmd += ['-S', str(sparse)]
+
+        cmd += [source, dest]
 
     start_time = timeutils.utcnow()
     utils.execute(*cmd, run_as_root=run_as_root)

@@ -22,13 +22,14 @@ import math
 import socket
 import time
 
+from oslo_concurrency import processutils
 from oslo.config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
 
 from cinder import exception
 from cinder.image import image_utils
 from cinder.openstack.common import fileutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils as putils
 from cinder.openstack.common import strutils
 from cinder import utils
 from cinder.volume import driver
@@ -66,7 +67,7 @@ def _fromsizestr(sizestr):
 class ZFSVolumeDriver(driver.ISCSIDriver):
     """Executes commands relating to Volumes."""
 
-    VERSION = '1.0.0'
+    VERSION = '1.0.1'
 
     def __init__(self, *args, **kwargs):
         super(ZFSVolumeDriver, self).__init__(*args, **kwargs)
@@ -75,7 +76,19 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
         self.backend_name =\
             self.configuration.safe_get('volume_backend_name') or 'ZFS'
 
-        self.target_helper = self.get_target_helper(self.db)
+        target_driver = \
+            self.target_mapping[self.configuration.safe_get('iscsi_helper')]
+
+        LOG.debug('Attempting to initialize ZFS driver with the '
+                  'following target_driver: %s',
+                  target_driver)
+
+        self.target_driver = importutils.import_object(
+            target_driver,
+            configuration=self.configuration,
+            db=self.db,
+            executor=self._execute)
+        self.protocol = self.target_driver.protocol        
 
     def check_for_setup_error(self):
         """Verify that requirements are in place to use ZFS driver."""
@@ -131,7 +144,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
             self._execute('zfs', 'destroy', '-r', full_name,
                           run_as_root=True)
             return True
-        except putils.ProcessExecutionError as err:
+        except processutils.ProcessExecutionError as err:
             if "dataset is busy" in err.stderr:
                 mesg = (_('Unable to delete volume %s due to it being busy') %
                         volume['name'])
@@ -164,7 +177,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
         try:
             self._execute(*cmd,
                           run_as_root=True)
-        except putils.ProcessExecutionError as err:
+        except processutils.ProcessExecutionError as err:
             LOG.exception(_('Error creating snapshot'))
             LOG.debug(_('Cmd     :%s') % err.cmd)
             LOG.debug(_('StdOut  :%s') % err.stdout)
@@ -180,7 +193,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
         try:
             self._execute('zfs', 'destroy', "-d", full_name,
                           run_as_root=True)
-        except putils.ProcessExecutionError as err:
+        except processutils.ProcessExecutionError as err:
             if "volume has children" in err.stderr:
                 mesg = (_('Unable to delete snapshot due to dependent '
                           'snapshots for volume: %s') % full_name)
@@ -199,7 +212,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
 
         try:
             self._execute('zfs', 'list', full_name, run_as_root=True)
-        except putils.ProcessExecutionError as err:
+        except processutils.ProcessExecutionError as err:
             if 'dataset does not exist' in err.stderr:
                 return False
             raise
@@ -293,8 +306,11 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
         self.create_volume_from_snapshot(volume, temp_snapshot)
 
     @utils.synchronized('zfs-imgcache', external=False)
-    def clone_image(self, volume, image_location, image_id, image_meta):
-        img_cache_snapshot = {'volume_name': 'img-%s' % image_id,
+
+    def clone_image(self, context, volume,
+                    image_location, image_meta,
+                    image_service):
+        img_cache_snapshot = {'volume_name': 'img-%s' % image_meta['id'],
                               'name': 'snap'}
 
         if self.snapshot_exists(img_cache_snapshot):
@@ -366,7 +382,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
             self._execute('zfs', 'set', 'volsize=%s' % _sizestr(new_size),
                           '%s/%s' % (self.zpool, volume['name']),
                           run_as_root=True)
-        except putils.ProcessExecutionError as err:
+        except processutils.ProcessExecutionError as err:
             LOG.exception(_('Error extending Volume'))
             LOG.debug(_('Cmd     :%s') % err.cmd)
             LOG.debug(_('StdOut  :%s') % err.stdout)
@@ -380,8 +396,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
         volume_path = self.local_path(volume)
         # NOTE(jdg): For TgtAdm case iscsi_name is the ONLY param we need
         # should clean this all up at some point in the future
-        model_update = self.target_helper.ensure_export(context, volume,
-                                                        iscsi_name,
+        model_update = self.target_driver.ensure_export(context, volume,
                                                         volume_path)
         if model_update:
             self.db.volume_update(context, volume['id'], model_update)
@@ -391,11 +406,11 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
 
         volume_path = self.local_path(volume)
 
-        data = self.target_helper.create_export(context, volume, volume_path, self.configuration)
+        data = self.target_driver.create_export(context, volume, volume_path)
         return {
             'provider_location': data['location'],
             'provider_auth': data['auth'],
         }
 
     def remove_export(self, context, volume):
-        self.target_helper.remove_export(context, volume)
+        self.target_driver.remove_export(context, volume)
