@@ -146,13 +146,13 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
             return True
         except processutils.ProcessExecutionError as err:
             if "dataset is busy" in err.stderr:
-                mesg = (_('Unable to delete volume %s due to it being busy') %
+                mesg = ('Unable to delete volume %s due to it being busy' %
                         volume['name'])
                 LOG.error(mesg)
                 raise exception.VolumeIsBusy(volume_name=volume['name'])
             elif "dataset does not exist" not in err.stderr:
-                mesg = (_('Error reported running zfs destroy: '
-                          'CMD: %(command)s, RESPONSE: %(response)s') %
+                mesg = ('Error reported running zfs destroy: '
+                          'CMD: %(command)s, RESPONSE: %(response)s' %
                         {'command': err.cmd, 'response': err.stderr})
                 LOG.error(mesg)
                 raise
@@ -178,10 +178,10 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
             self._execute(*cmd,
                           run_as_root=True)
         except processutils.ProcessExecutionError as err:
-            LOG.exception(_('Error creating snapshot'))
-            LOG.debug(_('Cmd     :%s') % err.cmd)
-            LOG.debug(_('StdOut  :%s') % err.stdout)
-            LOG.debug(_('StdErr  :%s') % err.stderr)
+            LOG.exception('Error creating snapshot')
+            LOG.debug('Cmd     :%s' % err.cmd)
+            LOG.debug('StdOut  :%s' % err.stdout)
+            LOG.debug('StdErr  :%s' % err.stderr)
             raise
 
     def delete_snapshot(self, snapshot):
@@ -195,14 +195,14 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
                           run_as_root=True)
         except processutils.ProcessExecutionError as err:
             if "volume has children" in err.stderr:
-                mesg = (_('Unable to delete snapshot due to dependent '
-                          'snapshots for volume: %s') % full_name)
+                mesg = ('Unable to delete snapshot due to dependent '
+                          'snapshots for volume: %s' % full_name)
                 LOG.error(mesg)
                 raise exception.VolumeIsBusy(
                     volume_name=snapshot['volume_name'])
             elif "dataset does not exist" not in err.stderr:
-                mesg = (_('Error reported running zfs destroy: '
-                          'CMD: %(command)s, RESPONSE: %(response)s') %
+                mesg = ('Error reported running zfs destroy: '
+                          'CMD: %(command)s, RESPONSE: %(response)s' %
                         {'command': err.cmd, 'response': err.stderr})
                 LOG.error(mesg)
                 raise
@@ -383,10 +383,10 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
                           '%s/%s' % (self.zpool, volume['name']),
                           run_as_root=True)
         except processutils.ProcessExecutionError as err:
-            LOG.exception(_('Error extending Volume'))
-            LOG.debug(_('Cmd     :%s') % err.cmd)
-            LOG.debug(_('StdOut  :%s') % err.stdout)
-            LOG.debug(_('StdErr  :%s') % err.stderr)
+            LOG.exception('Error extending Volume')
+            LOG.debug('Cmd     :%s' % err.cmd)
+            LOG.debug('StdOut  :%s' % err.stdout)
+            LOG.debug('StdErr  :%s' % err.stderr)
             raise
 
     def ensure_export(self, context, volume):
