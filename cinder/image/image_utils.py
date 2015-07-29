@@ -97,15 +97,15 @@ def check_qemu_img_version(minimum_version):
 def _convert_image(prefix, source, dest, out_format, run_as_root=True, sparse=0):
     """Convert image to other format."""
 
-    cmd = prefix + ['qemu-img', 'convert',
-                    '-O', out_format]
+    cmd = prefix + ('qemu-img', 'convert',
+                    '-O', out_format)
 
     if sparse:
         # Sparse wil skip writing zeroes, so one should only use it
         # on backing devices that are already zeroed.
-        cmd += ['-S', str(sparse)]
+        cmd += ('-S', str(sparse))
 
-    cmd += [source, dest]
+    cmd += (source, dest)
 
     # Check whether O_DIRECT is supported and set '-t none' if it is
     # This is needed to ensure that all data hit the device before
@@ -120,16 +120,16 @@ def _convert_image(prefix, source, dest, out_format, run_as_root=True, sparse=0)
             volume_utils.check_for_odirect_support(source,
                                                    dest,
                                                    'oflag=direct')):
-        cmd = prefix + ['qemu-img', 'convert',
+        cmd = prefix + ('qemu-img', 'convert',
                         '-t', 'none',
-                        '-O', out_format]
+                        '-O', out_format)
 
         if sparse:
             # Sparse wil skip writing zeroes, so one should only use it
             # on backing devices that are already zeroed.
-            cmd += ['-S', str(sparse)]
+            cmd += ('-S', str(sparse))
 
-        cmd += [source, dest]
+        cmd += (source, dest)
 
     start_time = timeutils.utcnow()
     utils.execute(*cmd, run_as_root=run_as_root)
@@ -152,13 +152,13 @@ def _convert_image(prefix, source, dest, out_format, run_as_root=True, sparse=0)
     LOG.info(msg, {"sz": fsz_mb, "mbps": mbps})
 
 
-def convert_image(source, dest, out_format, run_as_root=True, throttle=None):
+def convert_image(source, dest, out_format, run_as_root=True, throttle=None, sparse=0):
     if not throttle:
         throttle = throttling.Throttle.get_default()
     with throttle.subcommand(source, dest) as throttle_cmd:
         _convert_image(tuple(throttle_cmd['prefix']),
                        source, dest,
-                       out_format, run_as_root=run_as_root)
+                       out_format, run_as_root=run_as_root, sparse=sparse)
 
 
 def resize_image(source, size, run_as_root=False):

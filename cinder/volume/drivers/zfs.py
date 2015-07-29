@@ -88,7 +88,7 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
             configuration=self.configuration,
             db=self.db,
             executor=self._execute)
-        self.protocol = self.target_driver.protocol        
+        self.protocol = self.target_driver.protocol
 
     def check_for_setup_error(self):
         """Verify that requirements are in place to use ZFS driver."""
@@ -388,6 +388,13 @@ class ZFSVolumeDriver(driver.ISCSIDriver):
             LOG.debug('StdOut  :%s' % err.stdout)
             LOG.debug('StdErr  :%s' % err.stderr)
             raise
+
+        try:
+            self._execute('gpart', 'commit', 'zvol/%s/%s' % (self.zpool, volume['name']))
+        except processutils.ProcessExecutionError as err:
+            LOG.debug('Cmd     :%s' % err.cmd)
+            LOG.debug('StdOut  :%s' % err.stdout)
+            LOG.debug('StdErr  :%s' % err.stderr)
 
     def ensure_export(self, context, volume):
         volume_name = volume['name']
